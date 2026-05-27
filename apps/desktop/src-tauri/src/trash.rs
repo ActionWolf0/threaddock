@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
 };
@@ -74,8 +75,16 @@ pub fn load_trash_inventory() -> Result<Vec<TrashRecord>, String> {
             continue;
         }
 
-        if let Ok(Some(record)) = read_trash_record(&entry.path()) {
-            records.push(record);
+        match read_trash_record(&entry.path()) {
+            Ok(Some(record)) => records.push(record),
+            Ok(None) => {}
+            Err(error) => {
+                log::warn!(
+                    "Failed to inspect trash entry {}: {error}",
+                    entry.path().display()
+                );
+                records.push(corrupt_trash_record(&entry.path(), &error));
+            }
         }
     }
 
@@ -86,6 +95,16 @@ pub fn load_trash_inventory() -> Result<Vec<TrashRecord>, String> {
             .then_with(|| left.title.cmp(&right.title))
     });
     Ok(records)
+}
+
+pub fn trashed_thread_ids() -> Result<HashSet<String>, String> {
+    let mut ids = HashSet::new();
+    for record in load_trash_inventory()? {
+        if !record.thread_id.starts_with("corrupt-trash-") {
+            ids.insert(record.thread_id);
+        }
+    }
+    Ok(ids)
 }
 
 pub fn trash_threads(thread_ids: &[String]) -> Result<Vec<TrashRecord>, String> {
@@ -126,21 +145,48 @@ pub fn trash_threads(thread_ids: &[String]) -> Result<Vec<TrashRecord>, String> 
 }
 
 pub fn restore_trash_items(trash_ids: &[String]) -> Result<Vec<TrashRecord>, String> {
-    let codex_home = codex::load_thread_library()?.codex_home;
-    let archived_root = PathBuf::from(codex_home).join("archived_sessions");
+    let snapshot = codex::load_thread_library()?;
+    let existing_thread_ids = snapshot
+        .threads
+        .iter()
+        .map(|thread| thread.thread_id.clone())
+        .collect::<HashSet<_>>();
+    let codex_root = PathBuf::from(snapshot.codex_home);
+    let canonical_codex_root = codex_root.canonicalize().map_err(|error| {
+        format!(
+            "Failed to canonicalize Codex home {} before trash restore: {error}",
+            codex_root.display()
+        )
+    })?;
+    let archived_root = codex_root.join("archived_sessions");
     fs::create_dir_all(&archived_root).map_err(|error| {
         format!(
             "Failed to create archived session root {}: {error}",
             archived_root.display()
         )
     })?;
+    ensure_restore_root_is_safe(&canonical_codex_root, &archived_root)?;
 
     let mut restored = Vec::new();
+    let mut restoring_thread_ids = HashSet::new();
     for trash_id in trash_ids {
         let entry_root = trash_entry_root(trash_id)?;
         let metadata = read_trash_metadata(&entry_root)?;
+        if existing_thread_ids.contains(&metadata.thread_id) {
+            return Err(format!(
+                "Thread {} already exists in Codex. Purge one copy or choose a backup import mode before restoring this trash item.",
+                metadata.thread_id
+            ));
+        }
+        if !restoring_thread_ids.insert(metadata.thread_id.clone()) {
+            return Err(format!(
+                "Multiple selected trash items contain thread {}. Restore one copy at a time.",
+                metadata.thread_id
+            ));
+        }
         let payload_path = find_payload_path(&entry_root)?;
         let target_path = next_restore_path(&archived_root, &metadata.original_file_name);
+        ensure_restore_target_is_safe(&canonical_codex_root, &target_path)?;
         move_path(&payload_path, &target_path)?;
         fs::remove_file(entry_root.join(METADATA_FILE_NAME)).ok();
         fs::remove_dir_all(&entry_root).ok();
@@ -169,8 +215,11 @@ pub fn purge_trash_items(trash_ids: &[String]) -> Result<Vec<TrashRecord>, Strin
 
     for trash_id in trash_ids {
         let entry_root = trash_entry_root(trash_id)?;
-        let record = read_trash_record(&entry_root)?
-            .ok_or_else(|| format!("Trash item {trash_id} is no longer available."))?;
+        let record = match read_trash_record(&entry_root) {
+            Ok(Some(record)) => record,
+            Ok(None) => return Err(format!("Trash item {trash_id} is no longer available.")),
+            Err(error) => corrupt_trash_record(&entry_root, &error),
+        };
         fs::remove_dir_all(&entry_root)
             .map_err(|error| format!("Failed to purge {}: {error}", entry_root.display()))?;
         purged.push(record);
@@ -333,7 +382,7 @@ fn find_payload_path(entry_root: &Path) -> Result<PathBuf, String> {
 fn next_restore_path(root: &Path, original_file_name: &str) -> PathBuf {
     let safe_file_name = sanitize_file_component(original_file_name);
     let original = root.join(&safe_file_name);
-    if !original.exists() {
+    if !path_entry_exists(&original) {
         return original;
     }
 
@@ -349,7 +398,7 @@ fn next_restore_path(root: &Path, original_file_name: &str) -> PathBuf {
     let mut index = 2_usize;
     loop {
         let candidate = root.join(format!("{stem}-{index}.{extension}"));
-        if !candidate.exists() {
+        if !path_entry_exists(&candidate) {
             return candidate;
         }
         index += 1;
@@ -396,6 +445,91 @@ fn move_path(source: &Path, target: &Path) -> Result<(), String> {
                 .map_err(|error| format!("Failed to remove {}: {error}", source.display()))
         }
     }
+}
+
+fn ensure_restore_root_is_safe(
+    canonical_codex_root: &Path,
+    archived_root: &Path,
+) -> Result<(), String> {
+    let canonical_archive = archived_root.canonicalize().map_err(|error| {
+        format!(
+            "Failed to canonicalize archived session root {}: {error}",
+            archived_root.display()
+        )
+    })?;
+    if !canonical_archive.starts_with(canonical_codex_root) {
+        return Err(format!(
+            "Archived session root {} resolves outside Codex home {}.",
+            canonical_archive.display(),
+            canonical_codex_root.display()
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_restore_target_is_safe(canonical_codex_root: &Path, target: &Path) -> Result<(), String> {
+    let parent = target.parent().ok_or_else(|| {
+        format!(
+            "Unable to resolve restore target parent for {}.",
+            target.display()
+        )
+    })?;
+    let canonical_parent = parent.canonicalize().map_err(|error| {
+        format!(
+            "Failed to canonicalize restore target parent {}: {error}",
+            parent.display()
+        )
+    })?;
+    if !canonical_parent.starts_with(canonical_codex_root) {
+        return Err(format!(
+            "Restore target parent {} resolves outside Codex home {}.",
+            canonical_parent.display(),
+            canonical_codex_root.display()
+        ));
+    }
+    Ok(())
+}
+
+fn path_entry_exists(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
+fn corrupt_trash_record(entry_root: &Path, error: &str) -> TrashRecord {
+    let trash_id = entry_root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let now = Utc::now().to_rfc3339();
+    TrashRecord {
+        cwd: None,
+        deleted_at: now.clone(),
+        expires_at: now,
+        original_path: entry_root.display().to_string(),
+        original_status: TrashThreadStatus::Archived,
+        parent_thread_id: None,
+        raw_rollout_bytes: directory_size(entry_root).unwrap_or(0),
+        thread_id: format!("corrupt-trash-{trash_id}"),
+        thread_source: "unknown".to_string(),
+        title: format!("Corrupt trash item: {error}"),
+        trash_id,
+        trashed_path: entry_root.display().to_string(),
+    }
+}
+
+fn directory_size(path: &Path) -> Result<u64, String> {
+    let mut total = 0_u64;
+    for entry in walkdir::WalkDir::new(path) {
+        let entry =
+            entry.map_err(|error| format!("Failed to inspect {}: {error}", path.display()))?;
+        if entry.file_type().is_file() {
+            total += entry
+                .metadata()
+                .map_err(|error| format!("Failed to read {}: {error}", entry.path().display()))?
+                .len();
+        }
+    }
+    Ok(total)
 }
 
 fn trash_root() -> Result<PathBuf, String> {

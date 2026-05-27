@@ -240,7 +240,7 @@ const FAMILY_THREADS_PER_PAGE = 8;
 const WORKSPACES_PER_PAGE = 12;
 const BACKUPS_PER_PAGE = 10;
 const TRASH_PER_PAGE = 10;
-const APP_VERSION = "0.1.0";
+const APP_VERSION = "0.1.1";
 const OFFICIAL_GITHUB_REPOSITORY = "ActionWolf0/threaddock";
 
 const DEFAULT_FILTERS: ThreadFilters = {
@@ -307,6 +307,7 @@ export function App() {
     readTextSetting("threaddock.backupDirectory"),
   );
   const [backupFormat, setBackupFormat] = useState<BackupArtifactFormat>("zip");
+  const [codexBinaryPath, setCodexBinaryPath] = useState("");
   const [codexHomeOverride, setCodexHomeOverride] = useState("");
   const [alternateArchivePath, setAlternateArchivePath] = useState("");
   const [githubRepository, setGithubRepository] = useState(OFFICIAL_GITHUB_REPOSITORY);
@@ -364,6 +365,7 @@ export function App() {
     setState({ kind: "ready", snapshot });
     setBackupDirectory(snapshot.preferences.backupDirectory ?? "");
     setBackupFormat(snapshot.preferences.backupFormat);
+    setCodexBinaryPath(snapshot.preferences.codexBinaryPath ?? "");
     setCodexHomeOverride(snapshot.preferences.codexHomeOverride ?? "");
     setAlternateArchivePath(snapshot.preferences.alternateArchivePath ?? "");
     setGithubRepository(snapshot.preferences.githubRepository ?? OFFICIAL_GITHUB_REPOSITORY);
@@ -1169,9 +1171,17 @@ export function App() {
     if (selectedVisibleTrash.length === 0) {
       return;
     }
-    const trashIds = selectedVisibleTrash.map((record) => record.trashId);
+    const actionableTrash =
+      action === "restore"
+        ? selectedVisibleTrash.filter((record) => !isCorruptTrashRecord(record))
+        : selectedVisibleTrash;
+    if (actionableTrash.length === 0) {
+      setOperationError("Corrupt trash entries cannot be restored, but they can be deleted permanently.");
+      return;
+    }
+    const trashIds = actionableTrash.map((record) => record.trashId);
     openPreview({
-      bytes: selectedVisibleTrash.reduce((total, record) => total + record.rawRolloutBytes, 0),
+      bytes: actionableTrash.reduce((total, record) => total + record.rawRolloutBytes, 0),
       confirmLabel: action === "restore" ? "Restore from trash" : "Delete permanently",
       danger: action === "purge",
       description:
@@ -1196,11 +1206,15 @@ export function App() {
         action === "restore"
           ? `Restore ${trashIds.length} trashed threads?`
           : `Delete ${trashIds.length} trashed threads permanently?`,
-      trashItems: selectedVisibleTrash,
+      trashItems: actionableTrash,
     });
   });
 
   const handleSingleTrashAction = useEffectEvent((record: TrashRecord, action: "purge" | "restore") => {
+    if (action === "restore" && isCorruptTrashRecord(record)) {
+      setOperationError("This trash entry is corrupt and cannot be restored. Delete it permanently after confirming you no longer need the payload.");
+      return;
+    }
     openPreview({
       bytes: record.rawRolloutBytes,
       confirmLabel: action === "restore" ? "Restore from trash" : "Delete permanently",
@@ -1591,6 +1605,7 @@ export function App() {
         alternateArchivePath: alternateArchivePath || null,
         backupDirectory: backupDirectory || null,
         backupFormat,
+        codexBinaryPath: codexBinaryPath || null,
         codexHomeOverride: codexHomeOverride || null,
         githubRepository: githubRepository || OFFICIAL_GITHUB_REPOSITORY,
       });
@@ -1604,6 +1619,7 @@ export function App() {
   });
 
   const handleSettingsReset = useEffectEvent(async () => {
+    setCodexBinaryPath("");
     setCodexHomeOverride("");
     setAlternateArchivePath("");
     try {
@@ -1611,6 +1627,7 @@ export function App() {
         alternateArchivePath: null,
         backupDirectory: backupDirectory || null,
         backupFormat,
+        codexBinaryPath: null,
         codexHomeOverride: null,
         githubRepository: githubRepository || OFFICIAL_GITHUB_REPOSITORY,
       });
@@ -2745,6 +2762,7 @@ export function App() {
                 appServerReady={state.snapshot.appServer.available}
                 backupDirectory={backupDirectory}
                 backupFormat={backupFormat}
+                codexBinaryPath={codexBinaryPath}
                 codexHome={state.snapshot.codexHome}
                 codexHomeOverride={codexHomeOverride}
                 currentVersion={APP_VERSION}
@@ -2753,6 +2771,7 @@ export function App() {
                 onBackupDirectoryChange={setBackupDirectory}
                 onBackupFormatChange={setBackupFormat}
                 onCheckUpdates={handleCheckUpdates}
+                onCodexBinaryPathChange={setCodexBinaryPath}
                 onCodexHomeOverrideChange={setCodexHomeOverride}
                 onGithubRepositoryChange={setGithubRepository}
                 onRefreshBackups={handleBackupRefresh}
@@ -3534,6 +3553,7 @@ function TrashInspector({
   onRevealPath: (path: string) => Promise<void>;
   record: TrashRecord;
 }) {
+  const isCorrupt = isCorruptTrashRecord(record);
   return (
     <InspectorLens
       badge={<span className="status-badge status-trashed">trashed</span>}
@@ -3551,8 +3571,13 @@ function TrashInspector({
       ]}
       note="Trash entries stay recoverable until the guard expires."
       primaryActions={
-        <button type="button" className="action-primary" onClick={() => onAction(record, "restore")}>
-          Restore to archive vault
+        <button
+          type="button"
+          className="action-primary"
+          disabled={isCorrupt}
+          onClick={() => onAction(record, "restore")}
+        >
+          {isCorrupt ? "Restore unavailable" : "Restore to archive vault"}
         </button>
       }
       secondaryActions={
@@ -3876,6 +3901,7 @@ function SettingsPage({
   appServerReady,
   backupDirectory,
   backupFormat,
+  codexBinaryPath,
   codexHome,
   codexHomeOverride,
   currentVersion,
@@ -3884,6 +3910,7 @@ function SettingsPage({
   onBackupDirectoryChange,
   onBackupFormatChange,
   onCheckUpdates,
+  onCodexBinaryPathChange,
   onCodexHomeOverrideChange,
   onGithubRepositoryChange,
   onRefreshBackups,
@@ -3898,6 +3925,7 @@ function SettingsPage({
   appServerReady: boolean;
   backupDirectory: string;
   backupFormat: BackupArtifactFormat;
+  codexBinaryPath: string;
   codexHome: string;
   codexHomeOverride: string;
   currentVersion: string;
@@ -3906,6 +3934,7 @@ function SettingsPage({
   onBackupDirectoryChange: (value: string) => void;
   onBackupFormatChange: (value: BackupArtifactFormat) => void;
   onCheckUpdates: () => Promise<void>;
+  onCodexBinaryPathChange: (value: string) => void;
   onCodexHomeOverrideChange: (value: string) => void;
   onGithubRepositoryChange: (value: string) => void;
   onRefreshBackups: () => Promise<void>;
@@ -3942,6 +3971,14 @@ function SettingsPage({
             value={codexHomeOverride}
             onChange={(event) => onCodexHomeOverrideChange(event.target.value)}
             placeholder="Leave blank to use CODEX_HOME or ~/.codex"
+          />
+        </label>
+        <label className="backup-directory-field">
+          <span>Codex CLI binary path</span>
+          <input
+            value={codexBinaryPath}
+            onChange={(event) => onCodexBinaryPathChange(event.target.value)}
+            placeholder="Optional absolute path to codex, codex.exe, or codex.cmd"
           />
         </label>
         <label className="backup-directory-field">
@@ -4609,6 +4646,10 @@ function matchesTrashFilters(record: TrashRecord, filters: ThreadFilters): boole
     return false;
   }
   return true;
+}
+
+function isCorruptTrashRecord(record: TrashRecord): boolean {
+  return record.threadId.startsWith("corrupt-trash-");
 }
 
 function buildRuleMatches(threads: ThreadRecord[], draft: RuleDraft): ThreadRecord[] {

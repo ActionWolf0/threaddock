@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, File},
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
@@ -91,6 +91,7 @@ pub struct ScanIssue {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScanIssueKind {
+    DuplicateThreadId,
     MetadataUnreadable,
     MalformedRollout,
     MissingRollout,
@@ -214,6 +215,7 @@ pub fn load_thread_library() -> Result<ThreadLibrarySnapshot, String> {
     }
 
     let app_server_load = load_app_server_threads();
+    threads = deduplicate_threads(threads, &mut scan_issues);
     threads = merge_app_server_threads(threads, app_server_load.entries, &mut scan_issues);
     sort_threads(&mut threads);
 
@@ -372,7 +374,24 @@ fn scan_rollouts(
     let mut results = Vec::new();
     let mut issues = Vec::new();
 
-    for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
+    for entry in WalkDir::new(root) {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                issues.push(ScanIssue {
+                    kind: ScanIssueKind::MetadataUnreadable,
+                    severity: IssueSeverity::Warning,
+                    message: format!("Could not traverse {}: {error}", root.display()),
+                    path: error.path().map(|path| path.display().to_string()),
+                    thread_id: None,
+                });
+                log::warn!(
+                    "Skipping unreadable rollout path under {}: {error}",
+                    root.display()
+                );
+                continue;
+            }
+        };
         if !entry.file_type().is_file() {
             continue;
         }
@@ -636,6 +655,44 @@ fn merge_app_server_threads(
     merged.into_values().collect()
 }
 
+fn deduplicate_threads(
+    threads: Vec<ThreadRecord>,
+    scan_issues: &mut Vec<ScanIssue>,
+) -> Vec<ThreadRecord> {
+    let mut merged = HashMap::<String, ThreadRecord>::new();
+    let mut duplicate_ids = HashSet::<String>::new();
+
+    for thread in threads {
+        if let Some(existing) = merged.get(&thread.thread_id) {
+            duplicate_ids.insert(thread.thread_id.clone());
+            scan_issues.push(ScanIssue {
+                kind: ScanIssueKind::DuplicateThreadId,
+                severity: IssueSeverity::Warning,
+                message: format!(
+                    "Duplicate thread id {} appears at both {} and {}. ThreadDock is showing one copy to prevent unsafe actions.",
+                    thread.thread_id,
+                    existing.rollout_path,
+                    thread.rollout_path
+                ),
+                path: Some(thread.rollout_path.clone()),
+                thread_id: Some(thread.thread_id.clone()),
+            });
+            continue;
+        }
+
+        merged.insert(thread.thread_id.clone(), thread);
+    }
+
+    if !duplicate_ids.is_empty() {
+        log::warn!(
+            "Detected duplicate Codex thread ids during scan: {}",
+            duplicate_ids.into_iter().collect::<Vec<_>>().join(", ")
+        );
+    }
+
+    merged.into_values().collect()
+}
+
 fn sort_threads(threads: &mut [ThreadRecord]) {
     threads.sort_by(|left, right| {
         right
@@ -789,6 +846,34 @@ mod tests {
         assert_eq!(issues.len(), 1);
         assert!(matches!(issues[0].kind, ScanIssueKind::MissingRollout));
         assert_eq!(issues[0].thread_id.as_deref(), Some("thread-2"));
+    }
+
+    #[test]
+    fn deduplicate_threads_reports_duplicate_ids() {
+        let first = ThreadRecord {
+            thread_id: "thread-dup".to_string(),
+            title: "First".to_string(),
+            status: ThreadStatus::Active,
+            thread_source: ThreadSource::User,
+            read_only: false,
+            parent_thread_id: None,
+            cwd: None,
+            rollout_path: "C:/codex/sessions/thread-dup.jsonl".to_string(),
+            created_at: None,
+            updated_at: None,
+            raw_rollout_bytes: 10,
+        };
+        let mut second = first.clone();
+        second.title = "Second".to_string();
+        second.rollout_path = "C:/codex/archived_sessions/thread-dup.jsonl".to_string();
+
+        let mut issues = Vec::new();
+        let deduplicated = deduplicate_threads(vec![first, second], &mut issues);
+
+        assert_eq!(deduplicated.len(), 1);
+        assert_eq!(issues.len(), 1);
+        assert!(matches!(issues[0].kind, ScanIssueKind::DuplicateThreadId));
+        assert_eq!(issues[0].thread_id.as_deref(), Some("thread-dup"));
     }
 
     #[test]

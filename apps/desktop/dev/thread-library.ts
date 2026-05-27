@@ -139,18 +139,29 @@ interface BackupFamilyMetadata {
 
 interface HandoffHeader {
   algorithm: string;
-  artifactBytes: number;
-  backupSha256: string;
-  createdAt: string;
+  artifactBytes?: number;
+  backupSha256?: string;
+  createdAt?: string;
   handoffFormatVersion: number;
   handoffId: string;
   kdf: string;
   kdfIterations: number;
-  label: string;
+  label?: string;
   nonceHex: string;
   saltHex: string;
+  sourceArtifactName?: string;
+  sourceArtifactPath?: string;
+  threadCount?: number;
+  threaddockVersion?: string;
+  totalRolloutBytes?: number;
+}
+
+interface HandoffPrivateMetadata {
+  artifactBytes: number;
+  backupSha256: string;
+  createdAt: string;
+  label: string;
   sourceArtifactName: string;
-  sourceArtifactPath: string;
   threadCount: number;
   threaddockVersion: string;
   totalRolloutBytes: number;
@@ -188,7 +199,7 @@ const BACKUP_EXTENSION = ".threaddock-backup.zip";
 const BACKUP_FOLDER_EXTENSION = ".threaddock-backup";
 const HANDOFF_EXTENSION = ".threaddock-handoff";
 const HANDOFF_MAGIC = Buffer.from("THREADDOCK-HANDOFF-V1\n", "utf8");
-const HANDOFF_FORMAT_VERSION = 1;
+const HANDOFF_FORMAT_VERSION = 2;
 const HANDOFF_ALGORITHM = "AES-256-GCM";
 const HANDOFF_KDF = "PBKDF2-HMAC-SHA256";
 const HANDOFF_KDF_ITERATIONS = 210_000;
@@ -201,6 +212,7 @@ const DEFAULT_PREFERENCES: AppPreferences = {
   alternateArchivePath: null,
   backupDirectory: null,
   backupFormat: "zip",
+  codexBinaryPath: null,
   codexHomeOverride: null,
   githubRepository: OFFICIAL_GITHUB_REPOSITORY,
 };
@@ -523,6 +535,7 @@ export async function saveAppPreferences(
     alternateArchivePath: normalizeString(request.alternateArchivePath),
     backupDirectory: normalizeString(request.backupDirectory),
     backupFormat: request.backupFormat === "folder" ? "folder" : "zip",
+    codexBinaryPath: normalizeString(request.codexBinaryPath),
     codexHomeOverride: normalizeString(request.codexHomeOverride),
     githubRepository: normalizeString(request.githubRepository),
   };
@@ -588,24 +601,26 @@ export async function createSecureHandoff(
   const label = request.label?.trim() || backupRecord.label;
   const header: HandoffHeader = {
     algorithm: HANDOFF_ALGORITHM,
-    artifactBytes: bytes.length,
-    backupSha256,
-    createdAt,
     handoffFormatVersion: HANDOFF_FORMAT_VERSION,
     handoffId,
     kdf: HANDOFF_KDF,
     kdfIterations: HANDOFF_KDF_ITERATIONS,
-    label,
     nonceHex: nonce.toString("hex"),
     saltHex: salt.toString("hex"),
+  };
+  const privateMetadata: HandoffPrivateMetadata = {
+    artifactBytes: bytes.length,
+    backupSha256,
+    createdAt,
+    label,
     sourceArtifactName: artifactName,
-    sourceArtifactPath: artifactPath,
     threadCount: backupRecord.threadCount,
     threaddockVersion: "0.1.0",
     totalRolloutBytes: backupRecord.totalBytes,
   };
   const headerBytes = Buffer.from(JSON.stringify(header), "utf8");
-  const ciphertext = encryptHandoffPayload(bytes, passphrase, salt, nonce, headerBytes);
+  const plaintext = encodePrivateHandoffPayload(privateMetadata, bytes);
+  const ciphertext = encryptHandoffPayload(plaintext, passphrase, salt, nonce, headerBytes);
   const destinationDir = request.destinationDir?.trim() || path.dirname(artifactPath);
   await mkdir(destinationDir, { recursive: true });
   const targetPath = nextAvailableHandoffPath(
@@ -644,9 +659,9 @@ export async function previewSecureHandoff(
     throw new Error("A recovery phrase or passphrase is required.");
   }
 
-  const { header, plaintext } = await decryptHandoffFile(handoffPath, passphrase);
-  const actualSha256 = sha256Hex(plaintext);
-  if (actualSha256 !== header.backupSha256) {
+  const { artifactBytes, header, metadata } = await decryptHandoffFile(handoffPath, passphrase);
+  const actualSha256 = sha256Hex(artifactBytes);
+  if (actualSha256 !== metadata.backupSha256) {
     throw new Error("Secure handoff decrypted but failed checksum verification.");
   }
   const handoffId = validatePortableId(header.handoffId, "handoff id");
@@ -654,21 +669,21 @@ export async function previewSecureHandoff(
   await mkdir(DEV_HANDOFF_DIR, { recursive: true });
   const stagedArtifactPath = path.join(
     DEV_HANDOFF_DIR,
-    `${handoffId}-preview-${sanitizePortableFileName(header.sourceArtifactName)}`,
+    `${handoffId}-preview-${sanitizePortableFileName(metadata.sourceArtifactName)}`,
   );
-  await writeFile(stagedArtifactPath, plaintext);
+  await writeFile(stagedArtifactPath, artifactBytes);
 
   try {
     const backupRecord = await previewBackupArtifact({ artifactPath: stagedArtifactPath });
     return {
       algorithm: header.algorithm,
-      artifactBytes: header.artifactBytes,
-      backupSha256: header.backupSha256,
-      createdAt: header.createdAt,
+      artifactBytes: metadata.artifactBytes,
+      backupSha256: metadata.backupSha256,
+      createdAt: metadata.createdAt,
       handoffPath,
       kdf: header.kdf,
-      label: header.label,
-      originalArtifactName: header.sourceArtifactName,
+      label: metadata.label,
+      originalArtifactName: metadata.sourceArtifactName,
       threadCount: backupRecord.threadCount,
       threadIds: backupRecord.threadIds,
       totalBytes: backupRecord.totalBytes,
@@ -690,9 +705,9 @@ export async function importSecureHandoff(
     throw new Error("A recovery phrase or passphrase is required.");
   }
 
-  const { header, plaintext } = await decryptHandoffFile(handoffPath, passphrase);
-  const actualSha256 = sha256Hex(plaintext);
-  if (actualSha256 !== header.backupSha256) {
+  const { artifactBytes, header, metadata } = await decryptHandoffFile(handoffPath, passphrase);
+  const actualSha256 = sha256Hex(artifactBytes);
+  if (actualSha256 !== metadata.backupSha256) {
     throw new Error("Secure handoff decrypted but failed checksum verification.");
   }
   const handoffId = validatePortableId(header.handoffId, "handoff id");
@@ -700,9 +715,9 @@ export async function importSecureHandoff(
   await mkdir(DEV_HANDOFF_DIR, { recursive: true });
   const stagedArtifactPath = path.join(
     DEV_HANDOFF_DIR,
-    `${handoffId}-${sanitizePortableFileName(header.sourceArtifactName)}`,
+    `${handoffId}-${sanitizePortableFileName(metadata.sourceArtifactName)}`,
   );
-  await writeFile(stagedArtifactPath, plaintext);
+  await writeFile(stagedArtifactPath, artifactBytes);
 
   try {
     const result = await importBackupArtifact({
@@ -844,6 +859,9 @@ export async function exportBackup(request: BackupExportRequest): Promise<Backup
       sha256: sha256Hex(bytes),
     });
   }
+  const metadataThreads = threads.map((thread) =>
+    redactedThreadMetadata(thread, `threads/${thread.threadId}.jsonl`),
+  );
 
   const families = buildFamilyMetadata(request.families ?? [], threadMap);
   const familyRoots = families.flatMap((family) =>
@@ -856,7 +874,7 @@ export async function exportBackup(request: BackupExportRequest): Promise<Backup
     threaddockVersion: "0.1.0",
     label,
     mode: request.mode,
-    sourceCodexHome: snapshot.codexHome,
+    sourceCodexHome: "redacted",
     exportedThreadIds: threadIds,
     exportedFamilyRoots: familyRoots,
     totalRolloutBytes: totalBytes,
@@ -865,8 +883,8 @@ export async function exportBackup(request: BackupExportRequest): Promise<Backup
 
   const artifactBytes =
     format === "zip"
-      ? await writeZipBackup(targetPath, threads, families, manifest)
-      : await writeFolderBackup(targetPath, threads, families, manifest);
+      ? await writeZipBackup(targetPath, threads, metadataThreads, families, manifest)
+      : await writeFolderBackup(targetPath, threads, metadataThreads, families, manifest);
 
   const record = {
     artifactBytes,
@@ -877,7 +895,7 @@ export async function exportBackup(request: BackupExportRequest): Promise<Backup
     format,
     label,
     manifestVersion: BACKUP_FORMAT_VERSION,
-    sourceCodexHome: snapshot.codexHome,
+    sourceCodexHome: "redacted",
     targetPath,
     threadCount: threadIds.length,
     threadIds,
@@ -1107,7 +1125,7 @@ function encryptHandoffPayload(
 async function decryptHandoffFile(
   targetPath: string,
   passphrase: string,
-): Promise<{ header: HandoffHeader; plaintext: Buffer }> {
+): Promise<{ artifactBytes: Buffer; header: HandoffHeader; metadata: HandoffPrivateMetadata }> {
   const bytes = await readFile(targetPath);
   if (!bytes.subarray(0, HANDOFF_MAGIC.length).equals(HANDOFF_MAGIC)) {
     throw new Error(`${targetPath} is not a ThreadDock secure handoff.`);
@@ -1120,7 +1138,7 @@ async function decryptHandoffFile(
   const headerBytes = payload.subarray(0, headerEnd);
   const header = JSON.parse(headerBytes.toString("utf8")) as HandoffHeader;
   if (
-    header.handoffFormatVersion !== HANDOFF_FORMAT_VERSION ||
+    (header.handoffFormatVersion !== HANDOFF_FORMAT_VERSION && header.handoffFormatVersion !== 1) ||
     header.algorithm !== HANDOFF_ALGORITHM ||
     header.kdf !== HANDOFF_KDF ||
     header.kdfIterations !== HANDOFF_KDF_ITERATIONS
@@ -1143,13 +1161,50 @@ async function decryptHandoffFile(
   decipher.setAAD(headerBytes);
   decipher.setAuthTag(tag);
   try {
+    const plaintext = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+    const { artifactBytes, metadata } =
+      header.handoffFormatVersion === 1
+        ? { artifactBytes: plaintext, metadata: legacyPrivateHandoffMetadata(header) }
+        : decodePrivateHandoffPayload(plaintext);
     return {
+      artifactBytes,
       header,
-      plaintext: Buffer.concat([decipher.update(encrypted), decipher.final()]),
+      metadata,
     };
   } catch {
     throw new Error("Recovery phrase rejected or secure handoff is corrupted.");
   }
+}
+
+function encodePrivateHandoffPayload(metadata: HandoffPrivateMetadata, artifactBytes: Buffer): Buffer {
+  return Buffer.concat([Buffer.from(JSON.stringify(metadata), "utf8"), Buffer.from("\n"), artifactBytes]);
+}
+
+function decodePrivateHandoffPayload(payload: Buffer): { artifactBytes: Buffer; metadata: HandoffPrivateMetadata } {
+  const metadataEnd = payload.indexOf(0x0a);
+  if (metadataEnd < 0) {
+    throw new Error("Secure handoff private payload is malformed.");
+  }
+  return {
+    artifactBytes: payload.subarray(metadataEnd + 1),
+    metadata: JSON.parse(payload.subarray(0, metadataEnd).toString("utf8")) as HandoffPrivateMetadata,
+  };
+}
+
+function legacyPrivateHandoffMetadata(header: HandoffHeader): HandoffPrivateMetadata {
+  if (!header.createdAt || !header.label || !header.sourceArtifactName || !header.backupSha256) {
+    throw new Error("Legacy secure handoff is missing private metadata.");
+  }
+  return {
+    artifactBytes: header.artifactBytes ?? 0,
+    backupSha256: header.backupSha256,
+    createdAt: header.createdAt,
+    label: header.label,
+    sourceArtifactName: header.sourceArtifactName,
+    threadCount: header.threadCount ?? 0,
+    threaddockVersion: header.threaddockVersion ?? "unknown",
+    totalRolloutBytes: header.totalRolloutBytes ?? 0,
+  };
 }
 
 function deriveHandoffKey(passphrase: string, salt: Buffer): Buffer {
@@ -1703,6 +1758,14 @@ function buildFamilyMetadata(
   }));
 }
 
+function redactedThreadMetadata(thread: ThreadRecord, archivePath: string): ThreadRecord {
+  return {
+    ...thread,
+    cwd: null,
+    rolloutPath: archivePath,
+  };
+}
+
 function buildBackupLabel(
   mode: BackupExportMode,
   families: BackupFamilyDescriptor[],
@@ -1793,6 +1856,8 @@ async function inspectBackupArtifact(
     }
 
     const manifest = await readManifestFromFolder(targetPath);
+    validateBackupManifest(manifest);
+    await verifyFolderBackupArtifact(targetPath, manifest);
     return recordFromManifest(manifest, targetPath, await directorySize(targetPath), "folder");
   }
 
@@ -1801,6 +1866,8 @@ async function inspectBackupArtifact(
   }
 
   const manifest = await readManifestFromZip(targetPath);
+  validateBackupManifest(manifest);
+  verifyZipBackupArtifact(new Uint8Array(await readFile(targetPath)), manifest);
   return recordFromManifest(manifest, targetPath, statSync(targetPath).size, "zip");
 }
 
@@ -2031,6 +2098,7 @@ function sha256Hex(bytes: Uint8Array): string {
 async function writeZipBackup(
   targetPath: string,
   threads: ThreadRecord[],
+  metadataThreads: ThreadRecord[],
   families: BackupFamilyMetadata[],
   manifest: BackupManifest,
 ): Promise<number> {
@@ -2043,7 +2111,7 @@ async function writeZipBackup(
   }
 
   zipEntries["manifest.json"] = strToU8(JSON.stringify(manifest, null, 2));
-  zipEntries["metadata/threads.json"] = strToU8(JSON.stringify(threads, null, 2));
+  zipEntries["metadata/threads.json"] = strToU8(JSON.stringify(metadataThreads, null, 2));
   zipEntries["metadata/families.json"] = strToU8(JSON.stringify(families, null, 2));
 
   const archive = zipSync(zipEntries, { level: 9 });
@@ -2055,6 +2123,7 @@ async function writeZipBackup(
 async function writeFolderBackup(
   targetPath: string,
   threads: ThreadRecord[],
+  metadataThreads: ThreadRecord[],
   families: BackupFamilyMetadata[],
   manifest: BackupManifest,
 ): Promise<number> {
@@ -2071,7 +2140,7 @@ async function writeFolderBackup(
   await writeFile(path.join(targetPath, "manifest.json"), JSON.stringify(manifest, null, 2));
   await writeFile(
     path.join(targetPath, "metadata", "threads.json"),
-    JSON.stringify(threads, null, 2),
+    JSON.stringify(metadataThreads, null, 2),
   );
   await writeFile(
     path.join(targetPath, "metadata", "families.json"),
@@ -2102,7 +2171,7 @@ async function verifyFolderBackupArtifact(
   manifest: BackupManifest,
 ): Promise<void> {
   for (const file of manifest.files) {
-    const bytes = new Uint8Array(await readFile(path.join(targetPath, file.archivePath)));
+    const bytes = new Uint8Array(await readFile(safeArtifactPath(targetPath, file.archivePath)));
     if (sha256Hex(bytes) !== file.sha256) {
       throw new Error(`Backup verification failed for ${file.archivePath}: checksum mismatch.`);
     }

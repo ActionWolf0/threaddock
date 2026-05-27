@@ -24,11 +24,12 @@ use crate::backup::{
 const APP_DIR_NAME: &str = "ThreadDock";
 const HANDOFF_DIR_NAME: &str = "handoff-staging";
 const HANDOFF_EXTENSION: &str = ".threaddock-handoff";
-const HANDOFF_FORMAT_VERSION: u32 = 1;
+const HANDOFF_FORMAT_VERSION: u32 = 2;
 const HANDOFF_MAGIC: &[u8] = b"THREADDOCK-HANDOFF-V1\n";
 const HANDOFF_ALGORITHM: &str = "AES-256-GCM";
 const HANDOFF_KDF: &str = "PBKDF2-HMAC-SHA256";
 const HANDOFF_KDF_ITERATIONS: u32 = 210_000;
+const MAX_BUFFERED_HANDOFF_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -109,20 +110,42 @@ pub struct ImportHandoffResult {
 struct HandoffHeader {
     handoff_format_version: u32,
     handoff_id: String,
-    created_at: String,
-    threaddock_version: String,
-    label: String,
-    source_artifact_name: String,
-    source_artifact_path: String,
-    artifact_bytes: u64,
-    backup_sha256: String,
-    thread_count: usize,
-    total_rollout_bytes: u64,
     algorithm: String,
     kdf: String,
     kdf_iterations: u32,
     salt_hex: String,
     nonce_hex: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    threaddock_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_artifact_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_artifact_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    artifact_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backup_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thread_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    total_rollout_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HandoffPrivateMetadata {
+    created_at: String,
+    threaddock_version: String,
+    label: String,
+    source_artifact_name: String,
+    artifact_bytes: u64,
+    backup_sha256: String,
+    thread_count: usize,
+    total_rollout_bytes: u64,
 }
 
 pub fn create_secure_handoff(request: CreateHandoffRequest) -> Result<HandoffRecord, String> {
@@ -163,25 +186,36 @@ pub fn create_secure_handoff(request: CreateHandoffRequest) -> Result<HandoffRec
     let header = HandoffHeader {
         handoff_format_version: HANDOFF_FORMAT_VERSION,
         handoff_id: handoff_id.clone(),
-        created_at: created_at.clone(),
-        threaddock_version: env!("CARGO_PKG_VERSION").to_string(),
-        label: label.clone(),
-        source_artifact_name: artifact_name.clone(),
-        source_artifact_path: artifact_path.display().to_string(),
-        artifact_bytes: artifact_bytes.len() as u64,
-        backup_sha256: backup_sha256.clone(),
-        thread_count: backup_record.thread_count,
-        total_rollout_bytes: backup_record.total_bytes,
         algorithm: HANDOFF_ALGORITHM.to_string(),
         kdf: HANDOFF_KDF.to_string(),
         kdf_iterations: HANDOFF_KDF_ITERATIONS,
         salt_hex: hex_encode(&salt),
         nonce_hex: hex_encode(&nonce),
+        created_at: None,
+        threaddock_version: None,
+        label: None,
+        source_artifact_name: None,
+        source_artifact_path: None,
+        artifact_bytes: None,
+        backup_sha256: None,
+        thread_count: None,
+        total_rollout_bytes: None,
+    };
+    let private_metadata = HandoffPrivateMetadata {
+        created_at: created_at.clone(),
+        threaddock_version: env!("CARGO_PKG_VERSION").to_string(),
+        label: label.clone(),
+        source_artifact_name: artifact_name.clone(),
+        artifact_bytes: artifact_bytes.len() as u64,
+        backup_sha256: backup_sha256.clone(),
+        thread_count: backup_record.thread_count,
+        total_rollout_bytes: backup_record.total_bytes,
     };
 
     let header_json = serde_json::to_vec(&header)
         .map_err(|error| format!("Failed to serialize handoff header: {error}"))?;
-    let ciphertext = encrypt_payload(&artifact_bytes, &passphrase, &salt, &nonce, &header_json)?;
+    let plaintext = encode_private_payload(&private_metadata, &artifact_bytes)?;
+    let ciphertext = encrypt_payload(&plaintext, &passphrase, &salt, &nonce, &header_json)?;
     let destination =
         resolve_handoff_destination(request.destination_dir.as_deref(), &artifact_path)?;
     fs::create_dir_all(&destination).map_err(|error| {
@@ -217,7 +251,7 @@ pub fn create_secure_handoff(request: CreateHandoffRequest) -> Result<HandoffRec
         target_path: target_path.display().to_string(),
         original_artifact_name: artifact_name,
         created_at,
-        artifact_bytes: header.artifact_bytes,
+        artifact_bytes: private_metadata.artifact_bytes,
         encrypted_bytes,
         backup_sha256,
         thread_count: backup_record.thread_count,
@@ -243,10 +277,10 @@ pub fn preview_secure_handoff(
         return Err("A recovery phrase or passphrase is required.".to_string());
     }
 
-    let (header, artifact_bytes) = decrypt_handoff_file(&handoff_path, passphrase)?;
+    let (header, metadata, artifact_bytes) = decrypt_handoff_file(&handoff_path, passphrase)?;
     let handoff_id = validate_handoff_id(&header.handoff_id)?;
     let actual_sha256 = sha256_hex(&artifact_bytes);
-    if actual_sha256 != header.backup_sha256 {
+    if actual_sha256 != metadata.backup_sha256 {
         return Err("Secure handoff decrypted but failed checksum verification.".to_string());
     }
 
@@ -260,7 +294,7 @@ pub fn preview_secure_handoff(
     let staged_artifact_path = staging_root.join(format!(
         "{}-preview-{}",
         handoff_id,
-        sanitize_file_name(&header.source_artifact_name)
+        sanitize_file_name(&metadata.source_artifact_name)
     ));
     fs::write(&staged_artifact_path, artifact_bytes).map_err(|error| {
         format!(
@@ -275,11 +309,11 @@ pub fn preview_secure_handoff(
         })?;
         Ok(HandoffPreviewRecord {
             handoff_path: handoff_path.display().to_string(),
-            label: header.label.clone(),
-            original_artifact_name: header.source_artifact_name.clone(),
-            created_at: header.created_at.clone(),
-            artifact_bytes: header.artifact_bytes,
-            backup_sha256: header.backup_sha256.clone(),
+            label: metadata.label.clone(),
+            original_artifact_name: metadata.source_artifact_name.clone(),
+            created_at: metadata.created_at.clone(),
+            artifact_bytes: metadata.artifact_bytes,
+            backup_sha256: metadata.backup_sha256.clone(),
             thread_count: backup_record.thread_count,
             thread_ids: backup_record.thread_ids,
             total_bytes: backup_record.total_bytes,
@@ -311,10 +345,10 @@ pub fn import_secure_handoff(request: ImportHandoffRequest) -> Result<ImportHand
         return Err("A recovery phrase or passphrase is required.".to_string());
     }
 
-    let (header, artifact_bytes) = decrypt_handoff_file(&handoff_path, passphrase)?;
+    let (header, metadata, artifact_bytes) = decrypt_handoff_file(&handoff_path, passphrase)?;
     let handoff_id = validate_handoff_id(&header.handoff_id)?;
     let actual_sha256 = sha256_hex(&artifact_bytes);
-    if actual_sha256 != header.backup_sha256 {
+    if actual_sha256 != metadata.backup_sha256 {
         return Err("Secure handoff decrypted but failed checksum verification.".to_string());
     }
 
@@ -328,7 +362,7 @@ pub fn import_secure_handoff(request: ImportHandoffRequest) -> Result<ImportHand
     let staged_artifact_path = staging_root.join(format!(
         "{}-{}",
         handoff_id,
-        sanitize_file_name(&header.source_artifact_name)
+        sanitize_file_name(&metadata.source_artifact_name)
     ));
     fs::write(&staged_artifact_path, artifact_bytes).map_err(|error| {
         format!(
@@ -376,7 +410,18 @@ fn encrypt_payload(
         .map_err(|_| "Failed to encrypt secure handoff payload.".to_string())
 }
 
-fn decrypt_handoff_file(path: &Path, passphrase: &str) -> Result<(HandoffHeader, Vec<u8>), String> {
+fn decrypt_handoff_file(
+    path: &Path,
+    passphrase: &str,
+) -> Result<(HandoffHeader, HandoffPrivateMetadata, Vec<u8>), String> {
+    if let Ok(metadata) = fs::metadata(path) {
+        if metadata.len() > MAX_BUFFERED_HANDOFF_BYTES {
+            return Err(format!(
+                "Secure handoff {} is too large for the buffered importer. Split the backup or use a smaller artifact.",
+                path.display()
+            ));
+        }
+    }
     let bytes =
         fs::read(path).map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
     if !bytes.starts_with(HANDOFF_MAGIC) {
@@ -394,7 +439,8 @@ fn decrypt_handoff_file(path: &Path, passphrase: &str) -> Result<(HandoffHeader,
     let ciphertext = &payload[(header_end + 1)..];
     let header = serde_json::from_slice::<HandoffHeader>(header_json)
         .map_err(|error| format!("Failed to parse secure handoff header: {error}"))?;
-    if header.handoff_format_version != HANDOFF_FORMAT_VERSION {
+    if header.handoff_format_version != HANDOFF_FORMAT_VERSION && header.handoff_format_version != 1
+    {
         return Err(format!(
             "Unsupported secure handoff version {}.",
             header.handoff_format_version
@@ -423,7 +469,65 @@ fn decrypt_handoff_file(path: &Path, passphrase: &str) -> Result<(HandoffHeader,
             },
         )
         .map_err(|_| "Recovery phrase rejected or secure handoff is corrupted.".to_string())?;
-    Ok((header, plaintext))
+    let (metadata, artifact_bytes) = if header.handoff_format_version == 1 {
+        (legacy_private_metadata(&header)?, plaintext)
+    } else {
+        decode_private_payload(&plaintext)?
+    };
+    Ok((header, metadata, artifact_bytes))
+}
+
+fn encode_private_payload(
+    metadata: &HandoffPrivateMetadata,
+    artifact_bytes: &[u8],
+) -> Result<Vec<u8>, String> {
+    let metadata_json = serde_json::to_vec(metadata)
+        .map_err(|error| format!("Failed to serialize handoff private metadata: {error}"))?;
+    let mut payload = Vec::with_capacity(metadata_json.len() + 1 + artifact_bytes.len());
+    payload.extend_from_slice(&metadata_json);
+    payload.push(b'\n');
+    payload.extend_from_slice(artifact_bytes);
+    Ok(payload)
+}
+
+fn decode_private_payload(payload: &[u8]) -> Result<(HandoffPrivateMetadata, Vec<u8>), String> {
+    let metadata_end = payload
+        .iter()
+        .position(|value| *value == b'\n')
+        .ok_or_else(|| "Secure handoff private payload is malformed.".to_string())?;
+    let metadata = serde_json::from_slice::<HandoffPrivateMetadata>(&payload[..metadata_end])
+        .map_err(|error| format!("Failed to parse secure handoff private metadata: {error}"))?;
+    Ok((metadata, payload[(metadata_end + 1)..].to_vec()))
+}
+
+fn legacy_private_metadata(header: &HandoffHeader) -> Result<HandoffPrivateMetadata, String> {
+    Ok(HandoffPrivateMetadata {
+        created_at: header
+            .created_at
+            .clone()
+            .ok_or_else(|| "Legacy secure handoff is missing creation metadata.".to_string())?,
+        threaddock_version: header
+            .threaddock_version
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        label: header
+            .label
+            .clone()
+            .ok_or_else(|| "Legacy secure handoff is missing a label.".to_string())?,
+        source_artifact_name: header
+            .source_artifact_name
+            .clone()
+            .ok_or_else(|| "Legacy secure handoff is missing the artifact name.".to_string())?,
+        artifact_bytes: header
+            .artifact_bytes
+            .ok_or_else(|| "Legacy secure handoff is missing artifact size.".to_string())?,
+        backup_sha256: header
+            .backup_sha256
+            .clone()
+            .ok_or_else(|| "Legacy secure handoff is missing checksum metadata.".to_string())?,
+        thread_count: header.thread_count.unwrap_or_default(),
+        total_rollout_bytes: header.total_rollout_bytes.unwrap_or_default(),
+    })
 }
 
 fn derive_key(passphrase: &str, salt: &[u8]) -> [u8; 32] {
@@ -439,6 +543,14 @@ fn derive_key(passphrase: &str, salt: &[u8]) -> [u8; 32] {
 
 fn stage_backup_payload(artifact_path: &Path) -> Result<(Vec<u8>, String), String> {
     if artifact_path.is_file() {
+        if let Ok(metadata) = fs::metadata(artifact_path) {
+            if metadata.len() > MAX_BUFFERED_HANDOFF_BYTES {
+                return Err(format!(
+                    "Backup artifact {} is too large for secure handoff. Split it into smaller backups before encrypting.",
+                    artifact_path.display()
+                ));
+            }
+        }
         let bytes = fs::read(artifact_path).map_err(|error| {
             format!(
                 "Failed to read backup artifact {}: {error}",
@@ -454,6 +566,13 @@ fn stage_backup_payload(artifact_path: &Path) -> Result<(Vec<u8>, String), Strin
     }
 
     if artifact_path.is_dir() {
+        let source_bytes = directory_size(artifact_path)?;
+        if source_bytes > MAX_BUFFERED_HANDOFF_BYTES {
+            return Err(format!(
+                "Backup folder {} is too large for secure handoff. Split it into smaller backups before encrypting.",
+                artifact_path.display()
+            ));
+        }
         let folder_name = artifact_path
             .file_name()
             .and_then(|value| value.to_str())
@@ -590,6 +709,21 @@ fn sanitize_file_name(value: &str) -> String {
     }
 }
 
+fn directory_size(path: &Path) -> Result<u64, String> {
+    let mut total = 0_u64;
+    for entry in WalkDir::new(path) {
+        let entry =
+            entry.map_err(|error| format!("Failed to inspect {}: {error}", path.display()))?;
+        if entry.file_type().is_file() {
+            total += entry
+                .metadata()
+                .map_err(|error| format!("Failed to read {}: {error}", entry.path().display()))?
+                .len();
+        }
+    }
+    Ok(total)
+}
+
 fn slugify(value: &str) -> String {
     let mut slug = String::new();
     let mut last_dash = false;
@@ -640,4 +774,58 @@ fn hex_decode(value: &str) -> Result<Vec<u8>, String> {
         bytes.push(byte);
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_payload_round_trips_metadata_and_artifact() {
+        let metadata = HandoffPrivateMetadata {
+            created_at: "2026-05-27T12:00:00Z".to_string(),
+            threaddock_version: "0.1.0".to_string(),
+            label: "portable backup".to_string(),
+            source_artifact_name: "backup.threaddock-backup.zip".to_string(),
+            artifact_bytes: 7,
+            backup_sha256: sha256_hex(b"payload"),
+            thread_count: 2,
+            total_rollout_bytes: 7,
+        };
+
+        let payload = encode_private_payload(&metadata, b"payload").expect("encode payload");
+        let (decoded, artifact) = decode_private_payload(&payload).expect("decode payload");
+
+        assert_eq!(decoded.label, metadata.label);
+        assert_eq!(decoded.source_artifact_name, metadata.source_artifact_name);
+        assert_eq!(artifact, b"payload");
+    }
+
+    #[test]
+    fn v2_public_header_omits_private_metadata() {
+        let header = HandoffHeader {
+            handoff_format_version: HANDOFF_FORMAT_VERSION,
+            handoff_id: uuid::Uuid::new_v4().to_string(),
+            algorithm: HANDOFF_ALGORITHM.to_string(),
+            kdf: HANDOFF_KDF.to_string(),
+            kdf_iterations: HANDOFF_KDF_ITERATIONS,
+            salt_hex: "00".repeat(16),
+            nonce_hex: "11".repeat(12),
+            created_at: None,
+            threaddock_version: None,
+            label: None,
+            source_artifact_name: None,
+            source_artifact_path: None,
+            artifact_bytes: None,
+            backup_sha256: None,
+            thread_count: None,
+            total_rollout_bytes: None,
+        };
+
+        let json = serde_json::to_string(&header).expect("serialize header");
+        assert!(!json.contains("sourceArtifactPath"));
+        assert!(!json.contains("sourceArtifactName"));
+        assert!(!json.contains("label"));
+        assert!(!json.contains("backupSha256"));
+    }
 }

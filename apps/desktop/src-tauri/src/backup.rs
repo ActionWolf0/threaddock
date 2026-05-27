@@ -163,9 +163,9 @@ struct BackupFamilyMetadata {
 }
 
 #[derive(Debug)]
-struct VerifiedImportThread {
-    thread: ThreadRecord,
-    bytes: Vec<u8>,
+struct VerifiedImportMetadata {
+    manifest: BackupManifest,
+    threads_by_id: HashMap<String, ThreadRecord>,
 }
 
 #[derive(Debug)]
@@ -173,6 +173,14 @@ struct PlannedImport {
     destination_path: PathBuf,
     existing_path: Option<PathBuf>,
     temp_path: PathBuf,
+    thread_id: String,
+}
+
+#[derive(Debug)]
+struct CommittedImport {
+    destination_path: PathBuf,
+    existing_path: Option<PathBuf>,
+    replacement_backup_path: Option<PathBuf>,
     thread_id: String,
 }
 
@@ -300,6 +308,7 @@ pub fn export_backup(request: BackupExportRequest) -> Result<BackupRecord, Strin
     let mut manifest_files = Vec::new();
     let mut thread_payloads = Vec::new();
     for thread in &selected_threads {
+        validate_safe_component(&thread.thread_id, "thread id")?;
         let rollout_path = materialized_rollout_path(thread)?;
         let bytes = fs::read(&rollout_path).map_err(|error| {
             format!(
@@ -313,11 +322,11 @@ pub fn export_backup(request: BackupExportRequest) -> Result<BackupRecord, Strin
 
         manifest_files.push(ManifestFileEntry {
             thread_id: thread.thread_id.clone(),
-            archive_path,
+            archive_path: archive_path.clone(),
             rollout_bytes,
             sha256: checksum,
         });
-        thread_payloads.push(thread.clone());
+        thread_payloads.push(redacted_thread_metadata(thread, &archive_path));
     }
 
     let family_metadata = build_family_metadata(&request.families, &thread_map);
@@ -370,7 +379,7 @@ pub fn export_backup(request: BackupExportRequest) -> Result<BackupRecord, Strin
         family_mode: matches!(manifest.mode, BackupExportMode::Family),
         total_bytes,
         manifest_version: BACKUP_FORMAT_VERSION,
-        source_codex_home: snapshot.codex_home,
+        source_codex_home: "redacted".to_string(),
         thread_ids: unique_thread_ids,
         family_roots,
         artifact_bytes,
@@ -413,13 +422,21 @@ pub fn import_backup_artifact(request: BackupImportRequest) -> Result<BackupImpo
         ));
     }
 
-    let verified_threads = read_verified_import_threads_from_artifact(&artifact_path)?;
+    let verified_artifact = read_verified_import_metadata_from_artifact(&artifact_path)?;
     let existing_threads = snapshot
         .threads
         .iter()
         .map(|thread| (thread.thread_id.clone(), thread.clone()))
         .collect::<HashMap<_, _>>();
     let codex_root = PathBuf::from(&snapshot.codex_home);
+    let canonical_codex_root = codex_root.canonicalize().map_err(|error| {
+        format!(
+            "Failed to canonicalize Codex home {} before import: {error}",
+            codex_root.display()
+        )
+    })?;
+    let trashed_thread_ids = crate::trash::trashed_thread_ids()
+        .map_err(|error| format!("Failed to inspect ThreadDock trash before import: {error}"))?;
     let mut imported_thread_ids = Vec::new();
     let mut skipped_thread_ids = Vec::new();
     let mut staged_temp_paths = Vec::new();
@@ -427,9 +444,28 @@ pub fn import_backup_artifact(request: BackupImportRequest) -> Result<BackupImpo
     let plan_result = (|| {
         let mut plans = Vec::new();
 
-        for verified in verified_threads {
-            let thread = verified.thread;
+        for file in &verified_artifact.manifest.files {
+            let thread = verified_artifact
+                .threads_by_id
+                .get(&file.thread_id)
+                .cloned()
+                .ok_or_else(|| format!("Backup metadata is missing thread {}.", file.thread_id))?;
             validate_safe_component(&thread.thread_id, "thread id")?;
+
+            if trashed_thread_ids.contains(&thread.thread_id) {
+                match request.collision_mode {
+                    BackupImportCollisionMode::Skip => {
+                        skipped_thread_ids.push(thread.thread_id.clone());
+                        continue;
+                    }
+                    BackupImportCollisionMode::Replace => {
+                        return Err(format!(
+                            "Thread {} is currently in ThreadDock Trash. Restore or purge the trash item before replacing it from a backup.",
+                            thread.thread_id
+                        ));
+                    }
+                }
+            }
 
             let existing_path = if let Some(existing) = existing_threads.get(&thread.thread_id) {
                 match request.collision_mode {
@@ -447,6 +483,12 @@ pub fn import_backup_artifact(request: BackupImportRequest) -> Result<BackupImpo
 
                         let path = PathBuf::from(&existing.rollout_path);
                         if path.exists() {
+                            ensure_existing_path_is_safe(
+                                &codex_root,
+                                &canonical_codex_root,
+                                &path,
+                                "replacement source",
+                            )?;
                             Some(path)
                         } else {
                             None
@@ -461,7 +503,7 @@ pub fn import_backup_artifact(request: BackupImportRequest) -> Result<BackupImpo
                 import_destination_path(&codex_root, &thread, &request.restore_mode);
             ensure_path_stays_under(&codex_root, &destination_path, "import destination")?;
 
-            if destination_path.exists()
+            if path_entry_exists(&destination_path)
                 && !existing_path
                     .as_ref()
                     .is_some_and(|path| same_path_text(path, &destination_path))
@@ -478,13 +520,20 @@ pub fn import_backup_artifact(request: BackupImportRequest) -> Result<BackupImpo
             })?;
             fs::create_dir_all(parent)
                 .map_err(|error| format!("Failed to create {}: {error}", parent.display()))?;
+            ensure_destination_parent_is_safe(
+                &codex_root,
+                &canonical_codex_root,
+                &destination_path,
+                "import destination",
+            )?;
 
             let temp_path = next_available_file_path(&parent.join(format!(
                 ".threaddock-import-{}-{}.tmp",
                 slugify(&thread.thread_id),
                 Uuid::new_v4()
             )));
-            fs::write(&temp_path, &verified.bytes).map_err(|error| {
+            let verified_bytes = read_verified_artifact_payload(&artifact_path, file)?;
+            fs::write(&temp_path, &verified_bytes).map_err(|error| {
                 format!(
                     "Failed to stage thread {} to {}: {error}",
                     thread.thread_id,
@@ -498,7 +547,7 @@ pub fn import_backup_artifact(request: BackupImportRequest) -> Result<BackupImpo
                     temp_path.display()
                 )
             })?;
-            if sha256_hex(&staged_bytes) != sha256_hex(&verified.bytes) {
+            if sha256_hex(&staged_bytes) != file.sha256 {
                 return Err(format!(
                     "Staged bytes for thread {} failed checksum verification.",
                     thread.thread_id
@@ -525,18 +574,20 @@ pub fn import_backup_artifact(request: BackupImportRequest) -> Result<BackupImpo
         }
     };
 
+    let mut committed = Vec::new();
+    let mut rollback_files = Vec::new();
+
     for plan in plans {
         let replacement_backup_path = if let Some(existing_path) = plan.existing_path.as_ref() {
-            if existing_path.exists() {
+            if path_entry_exists(existing_path) {
                 let file_name = existing_path
                     .file_name()
                     .and_then(|value| value.to_str())
                     .unwrap_or("rollout.jsonl");
-                let backup_path =
-                    next_available_file_path(&existing_path.with_file_name(format!(
-                        ".threaddock-replace-{}-{file_name}",
-                        Uuid::new_v4()
-                    )));
+                let backup_path = next_available_file_path(&existing_path.with_file_name(format!(
+                    ".threaddock-replace-{}-{file_name}",
+                    Uuid::new_v4()
+                )));
                 fs::rename(existing_path, &backup_path).map_err(|error| {
                     format!(
                         "Failed to stage existing thread {} for replacement at {}: {error}",
@@ -544,6 +595,7 @@ pub fn import_backup_artifact(request: BackupImportRequest) -> Result<BackupImpo
                         existing_path.display()
                     )
                 })?;
+                rollback_files.push(backup_path.clone());
                 Some(backup_path)
             } else {
                 None
@@ -553,7 +605,13 @@ pub fn import_backup_artifact(request: BackupImportRequest) -> Result<BackupImpo
         };
 
         let commit_result = (|| {
-            if plan.destination_path.exists() {
+            ensure_destination_parent_is_safe(
+                &codex_root,
+                &canonical_codex_root,
+                &plan.destination_path,
+                "import destination",
+            )?;
+            if path_entry_exists(&plan.destination_path) {
                 return Err(format!(
                     "Import destination {} already exists.",
                     plan.destination_path.display()
@@ -570,32 +628,28 @@ pub fn import_backup_artifact(request: BackupImportRequest) -> Result<BackupImpo
         })();
 
         if let Err(error) = commit_result {
-            if let (Some(backup_path), Some(existing_path)) =
-                (replacement_backup_path.as_ref(), plan.existing_path.as_ref())
-            {
-                if let Err(restore_error) = fs::rename(backup_path, existing_path) {
-                    log::error!(
-                        "Failed to roll back replacement for {} from {} to {}: {restore_error}",
-                        plan.thread_id,
-                        backup_path.display(),
-                        existing_path.display()
-                    );
-                }
-            }
+            rollback_committed_imports(&mut committed);
+            rollback_current_replacement(&plan, replacement_backup_path.as_ref());
             let _ = fs::remove_file(&plan.temp_path);
             return Err(error);
         }
 
-        if let Some(backup_path) = replacement_backup_path {
-            if let Err(error) = fs::remove_file(&backup_path) {
-                log::warn!(
-                    "Failed to remove replacement rollback file {}: {error}",
-                    backup_path.display()
-                );
-            }
-        }
-
+        committed.push(CommittedImport {
+            destination_path: plan.destination_path,
+            existing_path: plan.existing_path,
+            replacement_backup_path,
+            thread_id: plan.thread_id.clone(),
+        });
         imported_thread_ids.push(plan.thread_id);
+    }
+
+    for backup_path in rollback_files {
+        if let Err(error) = fs::remove_file(&backup_path) {
+            log::warn!(
+                "Failed to remove replacement rollback file {}: {error}",
+                backup_path.display()
+            );
+        }
     }
 
     if let Err(error) = cache::append_activity(NewActivityRecord {
@@ -648,14 +702,18 @@ pub fn preview_backup_artifact(request: BackupPreviewRequest) -> Result<BackupRe
             artifact_path.display()
         )
     })?;
-    let verified_threads = read_verified_import_threads_from_artifact(&artifact_path)?;
-    if verified_threads.len() != record.thread_count {
+    let verified_artifact = read_verified_import_metadata_from_artifact(&artifact_path)?;
+    if verified_artifact.threads_by_id.len() != record.thread_count {
         return Err(format!(
             "Backup preview mismatch: manifest lists {} thread{} but {} payload{} verified.",
             record.thread_count,
             if record.thread_count == 1 { "" } else { "s" },
-            verified_threads.len(),
-            if verified_threads.len() == 1 { "" } else { "s" }
+            verified_artifact.threads_by_id.len(),
+            if verified_artifact.threads_by_id.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
         ));
     }
 
@@ -682,6 +740,13 @@ fn build_family_metadata(
             orphaned: family.orphaned,
         })
         .collect()
+}
+
+fn redacted_thread_metadata(thread: &ThreadRecord, archive_path: &str) -> ThreadRecord {
+    let mut redacted = thread.clone();
+    redacted.cwd = None;
+    redacted.rollout_path = archive_path.to_string();
+    redacted
 }
 
 fn build_backup_label(
@@ -855,6 +920,8 @@ pub(crate) fn inspect_backup_artifact(path: &Path) -> Result<Option<BackupRecord
         }
 
         let manifest = read_manifest_from_folder(path)?;
+        validate_backup_manifest(&manifest)?;
+        verify_folder_backup_artifact(path, &manifest)?;
         let artifact_bytes = directory_size(path)?;
         return Ok(Some(record_from_manifest(
             &manifest,
@@ -878,6 +945,8 @@ pub(crate) fn inspect_backup_artifact(path: &Path) -> Result<Option<BackupRecord
     }
 
     let manifest = read_manifest_from_zip(path)?;
+    validate_backup_manifest(&manifest)?;
+    verify_zip_backup_artifact(path, &manifest)?;
     let artifact_bytes = fs::metadata(path)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
@@ -889,9 +958,9 @@ pub(crate) fn inspect_backup_artifact(path: &Path) -> Result<Option<BackupRecord
     )))
 }
 
-fn read_verified_import_threads_from_artifact(
+fn read_verified_import_metadata_from_artifact(
     path: &Path,
-) -> Result<Vec<VerifiedImportThread>, String> {
+) -> Result<VerifiedImportMetadata, String> {
     let manifest = if path.is_dir() {
         read_manifest_from_folder(path)?
     } else {
@@ -900,7 +969,7 @@ fn read_verified_import_threads_from_artifact(
     validate_backup_manifest(&manifest)?;
 
     let thread_payloads = read_thread_payloads_from_artifact(path)?;
-    let mut payloads_by_id = thread_payloads
+    let payloads_by_id = thread_payloads
         .into_iter()
         .map(|thread| (thread.thread_id.clone(), thread))
         .collect::<HashMap<_, _>>();
@@ -922,32 +991,43 @@ fn read_verified_import_threads_from_artifact(
         }
     }
 
-    let mut verified_threads = Vec::new();
+    verify_backup_payloads(path, &manifest)?;
+
+    Ok(VerifiedImportMetadata {
+        manifest,
+        threads_by_id: payloads_by_id,
+    })
+}
+
+fn verify_backup_payloads(path: &Path, manifest: &BackupManifest) -> Result<(), String> {
     for file in &manifest.files {
-        let thread = payloads_by_id
-            .remove(&file.thread_id)
-            .ok_or_else(|| format!("Backup metadata is missing thread {}.", file.thread_id))?;
-        let bytes = read_artifact_entry(path, &file.archive_path)?;
+        let _ = read_verified_artifact_payload(path, file)?;
+    }
+    Ok(())
+}
 
-        if bytes.len() as u64 != file.rollout_bytes {
-            return Err(format!(
-                "Backup payload {} has an unexpected byte length.",
-                file.archive_path
-            ));
-        }
+fn read_verified_artifact_payload(
+    path: &Path,
+    file: &ManifestFileEntry,
+) -> Result<Vec<u8>, String> {
+    let bytes = read_artifact_entry(path, &file.archive_path)?;
 
-        let actual_sha256 = sha256_hex(&bytes);
-        if actual_sha256 != file.sha256 {
-            return Err(format!(
-                "Backup payload {} failed checksum verification.",
-                file.archive_path
-            ));
-        }
-
-        verified_threads.push(VerifiedImportThread { thread, bytes });
+    if bytes.len() as u64 != file.rollout_bytes {
+        return Err(format!(
+            "Backup payload {} has an unexpected byte length.",
+            file.archive_path
+        ));
     }
 
-    Ok(verified_threads)
+    let actual_sha256 = sha256_hex(&bytes);
+    if actual_sha256 != file.sha256 {
+        return Err(format!(
+            "Backup payload {} failed checksum verification.",
+            file.archive_path
+        ));
+    }
+
+    Ok(bytes)
 }
 
 fn read_thread_payloads_from_artifact(path: &Path) -> Result<Vec<ThreadRecord>, String> {
@@ -1083,7 +1163,9 @@ fn validate_backup_manifest(manifest: &BackupManifest) -> Result<(), String> {
     for thread_id in &manifest.exported_thread_ids {
         validate_safe_component(thread_id, "thread id")?;
         if !exported_ids.insert(thread_id.clone()) {
-            return Err(format!("Backup manifest contains duplicate thread id {thread_id}."));
+            return Err(format!(
+                "Backup manifest contains duplicate thread id {thread_id}."
+            ));
         }
     }
 
@@ -1112,8 +1194,7 @@ fn validate_backup_manifest(manifest: &BackupManifest) -> Result<(), String> {
             ));
         }
         validate_archive_path(&file.archive_path)?;
-        if file.sha256.len() != 64 || !file.sha256.chars().all(|value| value.is_ascii_hexdigit())
-        {
+        if file.sha256.len() != 64 || !file.sha256.chars().all(|value| value.is_ascii_hexdigit()) {
             return Err(format!(
                 "Backup manifest checksum for thread {} is malformed.",
                 file.thread_id
@@ -1123,7 +1204,9 @@ fn validate_backup_manifest(manifest: &BackupManifest) -> Result<(), String> {
     }
 
     if total_bytes != manifest.total_rollout_bytes {
-        return Err("Backup manifest total rollout bytes do not match payload entries.".to_string());
+        return Err(
+            "Backup manifest total rollout bytes do not match payload entries.".to_string(),
+        );
     }
 
     Ok(())
@@ -1135,7 +1218,9 @@ fn validate_safe_component(value: &str, label: &str) -> Result<(), String> {
         return Err(format!("Backup {label} cannot be empty."));
     }
     if trimmed == "." || trimmed == ".." {
-        return Err(format!("Backup {label} cannot be a path traversal component."));
+        return Err(format!(
+            "Backup {label} cannot be a path traversal component."
+        ));
     }
     if trimmed.len() > 256 {
         return Err(format!("Backup {label} is too long."));
@@ -1163,7 +1248,10 @@ fn validate_archive_path(archive_path: &str) -> Result<(), String> {
                     .ok_or_else(|| "Backup archive path is not valid UTF-8.".to_string())?;
                 validate_safe_component(value, "archive path component")?;
             }
-            Component::CurDir | Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
                 return Err("Backup archive path contains unsafe traversal.".to_string());
             }
         }
@@ -1203,6 +1291,138 @@ fn ensure_path_stays_under(root: &Path, path: &Path, label: &str) -> Result<(), 
     Ok(())
 }
 
+fn ensure_destination_parent_is_safe(
+    lexical_root: &Path,
+    canonical_root: &Path,
+    path: &Path,
+    label: &str,
+) -> Result<(), String> {
+    ensure_path_stays_under(lexical_root, path, label)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("Unable to resolve parent for {} {}.", label, path.display()))?;
+    reject_symlink_components(lexical_root, parent, label)?;
+    let canonical_parent = parent.canonicalize().map_err(|error| {
+        format!(
+            "Failed to canonicalize {} parent {}: {error}",
+            label,
+            parent.display()
+        )
+    })?;
+    if !canonical_parent.starts_with(canonical_root) {
+        return Err(format!(
+            "{} parent {} resolves outside Codex home {}.",
+            label,
+            canonical_parent.display(),
+            canonical_root.display()
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_existing_path_is_safe(
+    lexical_root: &Path,
+    canonical_root: &Path,
+    path: &Path,
+    label: &str,
+) -> Result<(), String> {
+    ensure_path_stays_under(lexical_root, path, label)?;
+    let canonical = path.canonicalize().map_err(|error| {
+        format!(
+            "Failed to canonicalize {} {}: {error}",
+            label,
+            path.display()
+        )
+    })?;
+    if !canonical.starts_with(canonical_root) {
+        return Err(format!(
+            "{} {} resolves outside Codex home {}.",
+            label,
+            canonical.display(),
+            canonical_root.display()
+        ));
+    }
+    Ok(())
+}
+
+fn reject_symlink_components(root: &Path, path: &Path, label: &str) -> Result<(), String> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| format!("{} {} escapes {}.", label, path.display(), root.display()))?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        match component {
+            Component::Normal(value) => {
+                current.push(value);
+                if fs::symlink_metadata(&current)
+                    .map(|metadata| metadata.file_type().is_symlink())
+                    .unwrap_or(false)
+                {
+                    return Err(format!(
+                        "{} {} uses a symlinked directory component, which ThreadDock will not write through.",
+                        label,
+                        current.display()
+                    ));
+                }
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(format!(
+                    "{} {} contains an unsafe path component.",
+                    label,
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn path_entry_exists(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
+fn rollback_committed_imports(committed: &mut Vec<CommittedImport>) {
+    while let Some(record) = committed.pop() {
+        if path_entry_exists(&record.destination_path) {
+            if let Err(error) = fs::remove_file(&record.destination_path) {
+                log::error!(
+                    "Failed to roll back imported thread {} at {}: {error}",
+                    record.thread_id,
+                    record.destination_path.display()
+                );
+            }
+        }
+
+        rollback_replacement(
+            &record.thread_id,
+            record.replacement_backup_path.as_ref(),
+            record.existing_path.as_ref(),
+        );
+    }
+}
+
+fn rollback_current_replacement(plan: &PlannedImport, backup_path: Option<&PathBuf>) {
+    rollback_replacement(&plan.thread_id, backup_path, plan.existing_path.as_ref());
+}
+
+fn rollback_replacement(
+    thread_id: &str,
+    backup_path: Option<&PathBuf>,
+    existing_path: Option<&PathBuf>,
+) {
+    if let (Some(backup_path), Some(existing_path)) = (backup_path, existing_path) {
+        if let Err(restore_error) = fs::rename(backup_path, existing_path) {
+            log::error!(
+                "Failed to roll back replacement for {} from {} to {}: {restore_error}",
+                thread_id,
+                backup_path.display(),
+                existing_path.display()
+            );
+        }
+    }
+}
+
 fn same_path_text(left: &Path, right: &Path) -> bool {
     let left = left.to_string_lossy();
     let right = right.to_string_lossy();
@@ -1215,7 +1435,7 @@ fn same_path_text(left: &Path, right: &Path) -> bool {
 }
 
 fn next_available_file_path(path: &Path) -> PathBuf {
-    if !path.exists() {
+    if !path_entry_exists(path) {
         return path.to_path_buf();
     }
 
@@ -1233,7 +1453,7 @@ fn next_available_file_path(path: &Path) -> PathBuf {
             _ => format!("{stem}-{index}"),
         };
         let candidate = parent.join(file_name);
-        if !candidate.exists() {
+        if !path_entry_exists(&candidate) {
             return candidate;
         }
         index += 1;
@@ -1243,7 +1463,10 @@ fn next_available_file_path(path: &Path) -> PathBuf {
 fn cleanup_temp_files(paths: &[PathBuf]) {
     for path in paths {
         if let Err(error) = fs::remove_file(path) {
-            log::warn!("Failed to remove staged import file {}: {error}", path.display());
+            log::warn!(
+                "Failed to remove staged import file {}: {error}",
+                path.display()
+            );
         }
     }
 }
@@ -1375,13 +1598,7 @@ fn verify_zip_backup_artifact(path: &Path, manifest: &BackupManifest) -> Result<
 
 fn verify_folder_backup_artifact(path: &Path, manifest: &BackupManifest) -> Result<(), String> {
     for entry in &manifest.files {
-        let bytes = fs::read(path.join(&entry.archive_path)).map_err(|error| {
-            format!(
-                "Backup verification failed while reading {} from {}: {error}",
-                entry.archive_path,
-                path.display()
-            )
-        })?;
+        let bytes = read_artifact_entry(path, &entry.archive_path)?;
 
         let actual = sha256_hex(&bytes);
         if actual != entry.sha256 {
@@ -1398,10 +1615,9 @@ fn verify_folder_backup_artifact(path: &Path, manifest: &BackupManifest) -> Resu
 
 fn directory_size(path: &Path) -> Result<u64, String> {
     let mut total = 0_u64;
-    for entry in walkdir::WalkDir::new(path)
-        .into_iter()
-        .filter_map(Result::ok)
-    {
+    for entry in walkdir::WalkDir::new(path) {
+        let entry =
+            entry.map_err(|error| format!("Failed to inspect {}: {error}", path.display()))?;
         if entry.file_type().is_file() {
             total += entry
                 .metadata()
@@ -1617,10 +1833,66 @@ mod tests {
             .expect("write metadata");
         zip.finish().expect("finish zip");
 
-        let error =
-            read_verified_import_threads_from_artifact(&archive_path).expect_err("reject mismatch");
+        let error = read_verified_import_metadata_from_artifact(&archive_path)
+            .expect_err("reject mismatch");
         assert!(error.contains("checksum"));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn inspect_backup_artifact_rejects_missing_payload() {
+        let root = temp_path("missing-payload");
+        fs::create_dir_all(&root).expect("create temp directory");
+        let archive_path = root.join(format!("artifact{BACKUP_EXTENSION}"));
+        let manifest = BackupManifest {
+            backup_format_version: BACKUP_FORMAT_VERSION,
+            created_at: "2026-05-26T19:00:00Z".to_string(),
+            threaddock_version: "0.1.0".to_string(),
+            label: "test".to_string(),
+            mode: BackupExportMode::Threads,
+            source_codex_home: "redacted".to_string(),
+            exported_thread_ids: vec!["thread-1".to_string()],
+            exported_family_roots: Vec::new(),
+            total_rollout_bytes: 5,
+            files: vec![ManifestFileEntry {
+                thread_id: "thread-1".to_string(),
+                archive_path: "threads/thread-1.jsonl".to_string(),
+                rollout_bytes: 5,
+                sha256: sha256_hex(b"hello"),
+            }],
+        };
+
+        let file = File::create(&archive_path).expect("create archive");
+        let mut zip = ZipWriter::new(file);
+        let options = FileOptions::default().compression_method(CompressionMethod::Deflated);
+        write_json_entry(&mut zip, "manifest.json", &manifest, options).expect("write manifest");
+        zip.finish().expect("finish zip");
+
+        let error = inspect_backup_artifact(&archive_path).expect_err("reject broken backup");
+        assert!(error.contains("missing"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn redacted_thread_metadata_removes_local_paths() {
+        let thread = ThreadRecord {
+            thread_id: "thread-1".to_string(),
+            title: "Fixture".to_string(),
+            status: codex::ThreadStatus::Archived,
+            thread_source: codex::ThreadSource::User,
+            read_only: false,
+            parent_thread_id: None,
+            cwd: Some("C:/Users/Alice/workspace".to_string()),
+            rollout_path: "C:/Users/Alice/.codex/sessions/thread-1.jsonl".to_string(),
+            created_at: None,
+            updated_at: None,
+            raw_rollout_bytes: 5,
+        };
+
+        let redacted = redacted_thread_metadata(&thread, "threads/thread-1.jsonl");
+        assert_eq!(redacted.cwd, None);
+        assert_eq!(redacted.rollout_path, "threads/thread-1.jsonl");
     }
 }

@@ -1,6 +1,7 @@
 use std::{
+    env,
     io::{BufRead, BufReader, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
 };
@@ -198,34 +199,22 @@ where
 }
 
 fn spawn_app_server() -> Result<std::process::Child, String> {
-    let codex_home_override = cache::load_app_preferences()
-        .ok()
-        .and_then(|preferences| preferences.codex_home_override);
-    let mut command = if cfg!(target_os = "windows") {
-        let mut command = Command::new("cmd.exe");
-        command.arg("/d").arg("/c");
+    let preferences = cache::load_app_preferences().ok();
+    let codex_home_override = preferences
+        .as_ref()
+        .and_then(|preferences| preferences.codex_home_override.clone());
+    let binary = resolve_codex_binary(
+        preferences
+            .as_ref()
+            .and_then(|preferences| preferences.codex_binary_path.as_deref()),
+    )?;
+    let mut command = Command::new(&binary);
+    command.arg("app-server");
 
-        if let Some(app_data) = std::env::var_os("APPDATA") {
-            let candidate = PathBuf::from(app_data).join("npm").join("codex.cmd");
-            if candidate.exists() {
-                command.arg(candidate);
-            } else {
-                command.arg("codex");
-            }
-        } else {
-            command.arg("codex");
-        }
-
-        command.arg("app-server");
-        command
-    } else {
-        let mut command = Command::new("codex");
-        command.arg("app-server");
-        command
-    };
-
-    if let Ok(cwd) = std::env::current_dir() {
+    if let Some(cwd) = codex_home_override.as_deref().and_then(existing_directory) {
         command.current_dir(cwd);
+    } else if let Some(home) = dirs::home_dir() {
+        command.current_dir(home);
     }
 
     if let Some(codex_home_override) = codex_home_override {
@@ -240,7 +229,91 @@ fn spawn_app_server() -> Result<std::process::Child, String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| format!("Failed to launch Codex App Server: {error}"))
+        .map_err(|error| {
+            format!(
+                "Failed to launch Codex App Server using {}: {error}",
+                binary.display()
+            )
+        })
+}
+
+fn resolve_codex_binary(configured_path: Option<&str>) -> Result<PathBuf, String> {
+    if let Some(candidate) = configured_path
+        .map(str::trim)
+        .filter(|candidate| !candidate.is_empty())
+        .map(PathBuf::from)
+    {
+        return canonical_file(&candidate).ok_or_else(|| {
+            format!(
+                "Configured Codex binary is not a readable file: {}",
+                candidate.display()
+            )
+        });
+    }
+
+    for candidate in platform_codex_candidates() {
+        if let Some(path) = canonical_file(&candidate) {
+            return Ok(path);
+        }
+    }
+
+    Err("Unable to find the Codex CLI binary. Set a Codex binary path in Settings.".to_string())
+}
+
+fn platform_codex_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(app_data) = env::var_os("APPDATA") {
+            candidates.push(PathBuf::from(app_data).join("npm").join("codex.cmd"));
+        }
+        if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
+            candidates.push(PathBuf::from(local_app_data).join("npm").join("codex.cmd"));
+        }
+        candidates.extend(find_on_path(&["codex.exe", "codex.cmd", "codex.bat"]));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Some(home) = dirs::home_dir() {
+            candidates.push(home.join(".cargo").join("bin").join("codex"));
+            candidates.push(home.join(".local").join("bin").join("codex"));
+        }
+        candidates.push(PathBuf::from("/opt/homebrew/bin/codex"));
+        candidates.push(PathBuf::from("/usr/local/bin/codex"));
+        candidates.push(PathBuf::from("/usr/bin/codex"));
+        candidates.extend(find_on_path(&["codex"]));
+    }
+
+    candidates
+}
+
+fn find_on_path(names: &[&str]) -> Vec<PathBuf> {
+    env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| env::split_paths(&paths).collect::<Vec<_>>())
+        .filter(|path| path.is_absolute())
+        .flat_map(|directory| names.iter().map(move |name| directory.join(name)))
+        .collect()
+}
+
+fn canonical_file(path: &Path) -> Option<PathBuf> {
+    let canonical = path.canonicalize().ok()?;
+    if canonical.is_file() {
+        Some(canonical)
+    } else {
+        None
+    }
+}
+
+fn existing_directory(path: &str) -> Option<PathBuf> {
+    let candidate = PathBuf::from(path.trim());
+    if candidate.is_dir() {
+        Some(candidate)
+    } else {
+        None
+    }
 }
 
 fn shutdown_child(

@@ -30,6 +30,7 @@ pub struct AppPreferences {
     pub backup_directory: Option<String>,
     #[serde(default)]
     pub backup_format: BackupArtifactFormat,
+    pub codex_binary_path: Option<String>,
     pub codex_home_override: Option<String>,
     pub github_repository: Option<String>,
 }
@@ -150,6 +151,7 @@ pub fn load_app_preferences() -> Result<AppPreferences, String> {
             .map(parse_backup_format)
             .transpose()?
             .unwrap_or_default(),
+        codex_binary_path: read_app_state(&connection, "codex_binary_path")?,
         github_repository: read_app_state(&connection, "github_repository")?
             .or_else(|| Some(OFFICIAL_GITHUB_REPOSITORY.to_string())),
     })
@@ -173,6 +175,10 @@ pub fn save_app_preferences(request: AppPreferences) -> Result<AppPreferences, S
         (
             "backup_format",
             Some(backup_format_label(&request.backup_format).to_string()),
+        ),
+        (
+            "codex_binary_path",
+            normalize_string(request.codex_binary_path),
         ),
         (
             "github_repository",

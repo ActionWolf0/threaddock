@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.1 - 2026-05-27
+
+Security and bug fixes.
+
 ## 0.1.0 - 2026-05-27
 
 Initial public release candidate.

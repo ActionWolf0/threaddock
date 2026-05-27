@@ -5,6 +5,7 @@ export type BackupArtifactFormat = "zip" | "folder";
 export type ThreadSortKey = "updated_desc" | "created_desc" | "title_asc" | "size_desc";
 export type IssueSeverity = "warning" | "error";
 export type ScanIssueKind =
+  | "duplicate_thread_id"
   | "metadata_unreadable"
   | "malformed_rollout"
   | "missing_rollout";
@@ -41,6 +42,7 @@ export interface AppPreferences {
   alternateArchivePath: string | null;
   backupDirectory: string | null;
   backupFormat: BackupArtifactFormat;
+  codexBinaryPath: string | null;
   codexHomeOverride: string | null;
   githubRepository: string | null;
 }
@@ -261,6 +263,7 @@ export interface SavePreferencesRequest {
   alternateArchivePath: string | null;
   backupDirectory: string | null;
   backupFormat: BackupArtifactFormat;
+  codexBinaryPath: string | null;
   codexHomeOverride: string | null;
   githubRepository: string | null;
 }
