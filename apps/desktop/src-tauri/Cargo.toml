@@ -1,0 +1,36 @@
+[package]
+name = "app"
+version = "0.1.0"
+description = "ThreadDock desktop application"
+authors = ["ThreadDock contributors"]
+license = "MIT"
+repository = "https://github.com/ActionWolf0/threaddock"
+edition = "2021"
+rust-version = "1.77.2"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.2", features = [] }
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+dirs = "6.0"
+walkdir = "2.5"
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+tauri = { version = "2.11.2", features = [] }
+tauri-plugin-log = "2"
+arboard = "3.6.1"
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+aes-gcm = { version = "0.10", features = ["std"] }
+pbkdf2 = "0.12"
+rand = "0.8"
+sha2 = "0.10"
+uuid = { version = "1.18.1", features = ["v4"] }
+zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
