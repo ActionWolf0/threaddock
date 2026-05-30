@@ -161,12 +161,15 @@ interface PaginatedResult<T> {
 interface HealthSummary {
   activityLog: ActivityRecord[];
   appServer: ThreadLibrarySnapshot["appServer"];
+  duplicateThreads: ThreadLibrarySnapshot["scanIssues"];
   largestFamilies: FamilyGroup[];
   largestThreads: ThreadRecord[];
   largestWorkspaces: WorkspaceGroup[];
+  malformedRollouts: ThreadLibrarySnapshot["scanIssues"];
   missingRollouts: ThreadLibrarySnapshot["scanIssues"];
   orphanedFamilies: FamilyGroup[];
   reclaimCandidates: ThreadRecord[];
+  threadHealth: ThreadHealthCheckSummary;
   totalIssues: number;
   unreadableMetadata: ThreadLibrarySnapshot["scanIssues"];
 }
@@ -180,6 +183,23 @@ interface BackupHealthSummary {
   score: number;
   verifiedArtifacts: number;
   warningCount: number;
+}
+
+interface ThreadHealthCheckSummary {
+  duplicateThreads: ThreadLibrarySnapshot["scanIssues"];
+  label: string;
+  malformedRollouts: ThreadLibrarySnapshot["scanIssues"];
+  missingRollouts: ThreadLibrarySnapshot["scanIssues"];
+  orphanedFamilies: FamilyGroup[];
+  readOnlyCount: number;
+  score: number;
+  staleCount: number;
+  unreadableMetadata: ThreadLibrarySnapshot["scanIssues"];
+}
+
+interface ThreadUserMetadata {
+  favoriteThreadIds: string[];
+  labelsByThreadId: Record<string, string[]>;
 }
 
 interface GitHubReleaseInfo {
@@ -240,7 +260,7 @@ const FAMILY_THREADS_PER_PAGE = 8;
 const WORKSPACES_PER_PAGE = 12;
 const BACKUPS_PER_PAGE = 10;
 const TRASH_PER_PAGE = 10;
-const APP_VERSION = "0.1.1";
+const APP_VERSION = "0.1.2";
 const OFFICIAL_GITHUB_REPOSITORY = "ActionWolf0/threaddock";
 
 const DEFAULT_FILTERS: ThreadFilters = {
@@ -318,12 +338,20 @@ export function App() {
   );
   const [handoffImportPath, setHandoffImportPath] = useState("");
   const [handoffPassphrase, setHandoffPassphrase] = useState("");
+  const [vaultLabel, setVaultLabel] = useState("");
+  const [vaultPassphrase, setVaultPassphrase] = useState("");
+  const [showVaultPassphrase, setShowVaultPassphrase] = useState(false);
   const [ruleDraft, setRuleDraft] = useState<RuleDraft>(() => readRuleDraftSetting());
   const [previewState, setPreviewState] = useState<null | PreviewState>(null);
   const [busyToken, setBusyToken] = useState<string | null>(null);
   const [operationError, setOperationError] = useState<string | null>(null);
   const [operationNotice, setOperationNotice] = useState<string | null>(null);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>({ kind: "idle" });
+  const [threadMetadata, setThreadMetadata] = useState<ThreadUserMetadata>(() =>
+    readThreadMetadataSetting(),
+  );
+  const [labelDraft, setLabelDraft] = useState("");
+  const [favoritesOnly, setFavoritesOnly] = useState(false);
 
   const applyFilters = useEffectEvent((partial: Partial<ThreadFilters>) => {
     setFilters((current) => ({ ...current, ...partial }));
@@ -459,6 +487,14 @@ export function App() {
   }, [ruleDraft]);
 
   useEffect(() => {
+    writeThreadMetadataSetting(threadMetadata);
+  }, [threadMetadata]);
+
+  useEffect(() => {
+    setLabelDraft("");
+  }, [selectedId]);
+
+  useEffect(() => {
     setThreadPage(1);
     setFamilyPage(1);
     setFamilyThreadPage(1);
@@ -467,7 +503,7 @@ export function App() {
     setTrashPage(1);
     setSelectedThreadIds([]);
     setSelectedTrashIds([]);
-  }, [filters, section]);
+  }, [favoritesOnly, filters, section]);
 
   const catalog = useMemo(() => {
     if (state.kind !== "ready") {
@@ -603,7 +639,9 @@ export function App() {
         return {
           families: [],
           threads: sortThreads(
-            catalog.activeThreads.filter((thread) => matchesThreadFilters(thread, effectiveFilters)),
+            catalog.activeThreads.filter((thread) =>
+              matchesThreadFilters(thread, effectiveFilters, threadMetadata, favoritesOnly),
+            ),
             effectiveFilters.sortKey,
           ),
         } satisfies VisibleSurface;
@@ -611,14 +649,18 @@ export function App() {
         return {
           families: [],
           threads: sortThreads(
-            catalog.archivedThreads.filter((thread) => matchesThreadFilters(thread, effectiveFilters)),
+            catalog.archivedThreads.filter((thread) =>
+              matchesThreadFilters(thread, effectiveFilters, threadMetadata, favoritesOnly),
+            ),
             effectiveFilters.sortKey,
           ),
         } satisfies VisibleSurface;
       case "subagents":
         return {
           families: sortFamilies(
-            catalog.families.filter((family) => matchesFamilyFilters(family, effectiveFilters)),
+            catalog.families.filter((family) =>
+              matchesFamilyFilters(family, effectiveFilters, threadMetadata, favoritesOnly),
+            ),
             effectiveFilters.sortKey,
           ),
           threads: [],
@@ -626,17 +668,19 @@ export function App() {
       default:
         return { families: [], threads: [] } satisfies VisibleSurface;
     }
-  }, [catalog, effectiveFilters, section, state]);
+  }, [catalog, effectiveFilters, favoritesOnly, section, state, threadMetadata]);
 
   const visibleWorkspaces = useMemo(() => {
     if (!catalog) {
       return [];
     }
     return sortWorkspaceGroups(
-      catalog.workspaceGroups.filter((group) => matchesWorkspaceFilters(group, effectiveFilters)),
+      catalog.workspaceGroups.filter((group) =>
+        matchesWorkspaceFilters(group, effectiveFilters, threadMetadata, favoritesOnly),
+      ),
       effectiveFilters.sortKey,
     );
-  }, [catalog, effectiveFilters]);
+  }, [catalog, effectiveFilters, favoritesOnly, threadMetadata]);
 
   const visibleTrash = useMemo(() => {
     return sortTrashRecords(
@@ -763,19 +807,36 @@ export function App() {
 
     const orphanedFamilies = catalog.families.filter((family) => family.isOrphaned);
     const missingRollouts = state.snapshot.scanIssues.filter((issue) => issue.kind === "missing_rollout");
+    const malformedRollouts = state.snapshot.scanIssues.filter((issue) => issue.kind === "malformed_rollout");
+    const duplicateThreads = state.snapshot.scanIssues.filter((issue) => issue.kind === "duplicate_thread_id");
     const unreadableMetadata = state.snapshot.scanIssues.filter(
       (issue) => issue.kind === "metadata_unreadable",
     );
+    const threadHealth = buildThreadHealthCheckSummary({
+      duplicateThreads,
+      malformedRollouts,
+      missingRollouts,
+      orphanedFamilies,
+      threads: state.snapshot.threads,
+      unreadableMetadata,
+    });
     return {
       activityLog: state.snapshot.activityLog,
       appServer: state.snapshot.appServer,
+      duplicateThreads,
       largestFamilies: sortFamilies([...catalog.families], "size_desc").slice(0, 8),
       largestThreads: sortThreads([...state.snapshot.threads], "size_desc").slice(0, 8),
       largestWorkspaces: sortWorkspaceGroups([...catalog.workspaceGroups], "size_desc").slice(0, 8),
+      malformedRollouts,
       missingRollouts,
       orphanedFamilies,
       reclaimCandidates: sortThreads([...catalog.archivedThreads], "size_desc").slice(0, 8),
-      totalIssues: state.snapshot.scanIssues.length + orphanedFamilies.length,
+      totalIssues: threadHealth.duplicateThreads.length +
+        threadHealth.malformedRollouts.length +
+        threadHealth.missingRollouts.length +
+        threadHealth.orphanedFamilies.length +
+        threadHealth.unreadableMetadata.length,
+      threadHealth,
       unreadableMetadata,
     } satisfies HealthSummary;
   }, [catalog, state]);
@@ -923,6 +984,63 @@ export function App() {
     } catch (error) {
       setOperationError(asErrorMessage(error, `Failed to copy ${label}.`));
     }
+  });
+
+  const handleToggleFavorite = useEffectEvent((threadId: string) => {
+    setThreadMetadata((current) => {
+      const favorites = new Set(current.favoriteThreadIds);
+      if (favorites.has(threadId)) {
+        favorites.delete(threadId);
+      } else {
+        favorites.add(threadId);
+      }
+      return {
+        ...current,
+        favoriteThreadIds: [...favorites],
+      };
+    });
+  });
+
+  const handleAddThreadLabel = useEffectEvent((threadId: string, value: string) => {
+    const label = normalizeThreadLabel(value);
+    if (!label) {
+      setOperationError("Labels need at least one letter or number.");
+      return;
+    }
+
+    setThreadMetadata((current) => {
+      const labels = new Set(getThreadLabels(current, threadId));
+      labels.add(label);
+      return {
+        ...current,
+        labelsByThreadId: {
+          ...current.labelsByThreadId,
+          [threadId]: [...labels].sort((left, right) => left.localeCompare(right)),
+        },
+      };
+    });
+    setLabelDraft("");
+    setOperationError(null);
+  });
+
+  const handleRemoveThreadLabel = useEffectEvent((threadId: string, label: string) => {
+    setThreadMetadata((current) => {
+      const labels = getThreadLabels(current, threadId).filter((item) => item !== label);
+      const labelsByThreadId = { ...current.labelsByThreadId };
+      if (labels.length > 0) {
+        labelsByThreadId[threadId] = labels;
+      } else {
+        delete labelsByThreadId[threadId];
+      }
+      return {
+        ...current,
+        labelsByThreadId,
+      };
+    });
+  });
+
+  const handleApplyWorkspaceGroup = useEffectEvent((workspaceKey: string) => {
+    applyFilters({ workspaceFilter: workspaceKey });
   });
 
   const handleRevealPath = useEffectEvent(async (targetPath: string) => {
@@ -1449,26 +1567,32 @@ export function App() {
     }
   });
 
-  const handleCreateHandoff = useEffectEvent(async (record: BackupRecord) => {
-    setBusyToken(`handoff:create:${record.backupId}`);
+  const handleCreateEncryptedVault = useEffectEvent(async (record: BackupRecord) => {
+    const label = vaultLabel.trim() || `${record.label} vault`;
+    const passphrase = vaultPassphrase.trim();
+    setBusyToken(`vault:create:${record.backupId}`);
     setOperationError(null);
     setOperationNotice(null);
     try {
       const handoff = await createSecureHandoff({
         artifactPath: record.targetPath,
         destinationDir: backupDirectory || null,
-        label: record.label,
+        label,
+        passphrase: passphrase || null,
       });
       setLastHandoff(handoff);
       setHandoffImportPath(handoff.targetPath);
       setHandoffPassphrase(handoff.recoveryPhrase);
       setHandoffPreview(null);
       setShowHandoffSecret(false);
+      setVaultLabel("");
+      setVaultPassphrase("");
+      setShowVaultPassphrase(false);
       setOperationNotice(
-        `Created secure handoff for ${record.label}. Save the recovery phrase before sharing the file.`,
+        `Created encrypted backup vault for ${record.label}. Save the recovery phrase before moving the file.`,
       );
     } catch (error) {
-      setOperationError(asErrorMessage(error, "Failed to create the secure handoff."));
+      setOperationError(asErrorMessage(error, "Failed to create the encrypted backup vault."));
     } finally {
       setBusyToken(null);
     }
@@ -1476,7 +1600,7 @@ export function App() {
 
   const handlePreviewHandoff = useEffectEvent(async () => {
     if (!handoffImportPath.trim() || !handoffPassphrase.trim()) {
-      setOperationError("A secure handoff path and recovery phrase are required.");
+      setOperationError("An encrypted vault path and recovery phrase are required.");
       return;
     }
     setBusyToken("handoff:preview");
@@ -1489,11 +1613,11 @@ export function App() {
       });
       setHandoffPreview(preview);
       setOperationNotice(
-        `Preview verified ${preview.threadCount} secure handoff thread${preview.threadCount === 1 ? "" : "s"}.`,
+        `Preview verified ${preview.threadCount} encrypted vault thread${preview.threadCount === 1 ? "" : "s"}.`,
       );
     } catch (error) {
       setHandoffPreview(null);
-      setOperationError(asErrorMessage(error, "Failed to preview the secure handoff."));
+      setOperationError(asErrorMessage(error, "Failed to preview the encrypted vault."));
     } finally {
       setBusyToken(null);
     }
@@ -1501,11 +1625,11 @@ export function App() {
 
   const handleImportHandoff = useEffectEvent(async () => {
     if (!handoffImportPath.trim() || !handoffPassphrase.trim()) {
-      setOperationError("A secure handoff path and recovery phrase are required.");
+      setOperationError("An encrypted vault path and recovery phrase are required.");
       return;
     }
     if (!handoffPreview) {
-      setOperationError("Preview and verify the secure handoff before importing it.");
+      setOperationError("Preview and verify the encrypted vault before importing it.");
       return;
     }
     setBusyToken("handoff:import");
@@ -1522,11 +1646,11 @@ export function App() {
       await refreshTrashInventory();
       setHandoffPreview(null);
       setOperationNotice(
-        `Imported ${result.importedCount} secure handoff threads and skipped ${result.skippedCount}.`,
+        `Imported ${result.importedCount} encrypted vault threads and skipped ${result.skippedCount}.`,
       );
       setSection("archives");
     } catch (error) {
-      setOperationError(asErrorMessage(error, "Failed to import the secure handoff."));
+      setOperationError(asErrorMessage(error, "Failed to import the encrypted vault."));
     } finally {
       setBusyToken(null);
     }
@@ -1696,7 +1820,7 @@ export function App() {
                   <input
                     value={filters.query}
                     onChange={(event) => applyFilters({ query: event.target.value })}
-                    placeholder="Search title, thread id, or workspace"
+                    placeholder="Search title, label, thread id, or workspace"
                   />
                 </label>
               )}
@@ -1786,6 +1910,28 @@ export function App() {
             <p>{operationNotice}</p>
           </section>
         )}
+
+        {state.kind === "ready" && catalog && (section === "library" || section === "archives") && (
+          <ThreadCurationPanel
+            favoritesOnly={favoritesOnly}
+            favoriteCount={threadMetadata.favoriteThreadIds.length}
+            labelCloud={buildLabelCloud(threadMetadata, state.snapshot.threads)}
+            onClearLabelFilter={() => applyFilters({ query: "" })}
+            onToggleFavoritesOnly={() => setFavoritesOnly((value) => !value)}
+            onUseLabel={(label) => applyFilters({ query: label })}
+          />
+        )}
+
+        {state.kind === "ready" &&
+          catalog &&
+          (section === "library" || section === "archives" || section === "workspaces") && (
+            <WorkspaceGroupingPanel
+              activeWorkspaceFilter={filters.workspaceFilter}
+              groups={catalog.workspaceGroups}
+              onClear={() => applyFilters({ workspaceFilter: "" })}
+              onSelect={handleApplyWorkspaceGroup}
+            />
+          )}
 
         {state.kind === "ready" && catalog && (
           <>
@@ -1905,6 +2051,7 @@ export function App() {
                                   }
                                 />
                               </th>
+                              <th>Fav</th>
                               <th>Thread</th>
                               <th>Workspace</th>
                               <th>Updated</th>
@@ -1932,10 +2079,31 @@ export function App() {
                                       }
                                     />
                                   </td>
+                                  <td onClick={(event) => event.stopPropagation()}>
+                                    <button
+                                      type="button"
+                                      className={
+                                        isFavoriteThread(threadMetadata, thread.threadId)
+                                          ? "favorite-button favorite-button-active"
+                                          : "favorite-button"
+                                      }
+                                      aria-label={
+                                        isFavoriteThread(threadMetadata, thread.threadId)
+                                          ? `Remove ${thread.title} from favorites`
+                                          : `Add ${thread.title} to favorites`
+                                      }
+                                      onClick={() => handleToggleFavorite(thread.threadId)}
+                                    >
+                                      ★
+                                    </button>
+                                  </td>
                                   <td>
                                     <div className="title-cell">
                                       <span>{thread.title}</span>
                                       <code>{thread.threadId.slice(0, 8)}</code>
+                                      <ThreadLabelPills
+                                        labels={getThreadLabels(threadMetadata, thread.threadId)}
+                                      />
                                     </div>
                                   </td>
                                   <td>{thread.cwd ?? "Unknown workspace"}</td>
@@ -1972,10 +2140,17 @@ export function App() {
                         familySizeByThreadId.get(selectedThread.threadId) ??
                         selectedThread.rawRolloutBytes
                       }
+                      favorite={isFavoriteThread(threadMetadata, selectedThread.threadId)}
+                      labelDraft={labelDraft}
+                      labels={getThreadLabels(threadMetadata, selectedThread.threadId)}
+                      onAddLabel={handleAddThreadLabel}
                       onArchiveToggle={handleArchiveToggle}
                       onBackup={handleThreadBackup}
+                      onLabelDraftChange={setLabelDraft}
                       onCopyThreadId={handleCopyText}
+                      onRemoveLabel={handleRemoveThreadLabel}
                       onRevealPath={handleRevealPath}
+                      onToggleFavorite={handleToggleFavorite}
                       onTrash={handleThreadTrash}
                       thread={selectedThread}
                     />
@@ -2205,6 +2380,18 @@ export function App() {
                 <BackupHealthPanel health={backupHealth} issues={backupIssues} />
 
                 <section className="utility-grid">
+                  <EncryptedVaultCreator
+                    backup={selectedBackup}
+                    busyToken={busyToken}
+                    label={vaultLabel}
+                    onCreate={handleCreateEncryptedVault}
+                    onLabelChange={setVaultLabel}
+                    onPassphraseChange={setVaultPassphrase}
+                    onTogglePassphrase={() => setShowVaultPassphrase((value) => !value)}
+                    passphrase={vaultPassphrase}
+                    showPassphrase={showVaultPassphrase}
+                  />
+
                   <article className="backup-panel">
                     <div className="inspector-heading">
                       <p className="eyebrow">Restore / Import</p>
@@ -2281,11 +2468,11 @@ export function App() {
 
                   <article className="backup-panel">
                     <div className="inspector-heading">
-                      <p className="eyebrow">Secure Handoff</p>
-                      <h3>Import encrypted handoff</h3>
+                      <p className="eyebrow">Encrypted Backup Vault</p>
+                      <h3>Open encrypted vault</h3>
                     </div>
                     <label className="backup-directory-field">
-                      <span>Handoff file</span>
+                      <span>Vault file</span>
                       <input
                         value={handoffImportPath}
                         onChange={(event) => {
@@ -2296,7 +2483,7 @@ export function App() {
                       />
                     </label>
                     <label className="backup-directory-field">
-                      <span>Recovery phrase</span>
+                      <span>Recovery phrase or passphrase</span>
                       <input
                         type="password"
                         autoComplete="off"
@@ -2334,7 +2521,7 @@ export function App() {
                         disabled={busyToken === "handoff:preview"}
                         onClick={() => void handlePreviewHandoff()}
                       >
-                        {busyToken === "handoff:preview" ? "Previewing..." : "Preview handoff"}
+                        {busyToken === "handoff:preview" ? "Previewing..." : "Preview vault"}
                       </button>
                       <button
                         type="button"
@@ -2346,7 +2533,7 @@ export function App() {
                       </button>
                     </div>
                     <p className="action-note">
-                      File-based and local-only. No open port, no LAN discovery, no cloud handoff.
+                      File-based and local-only. No open port, no LAN discovery, no cloud transfer.
                     </p>
                   </article>
                 </section>
@@ -2427,7 +2614,7 @@ export function App() {
                         backup={selectedBackup}
                         busyToken={busyToken}
                         onRevealPath={handleRevealPath}
-                        onCreateHandoff={handleCreateHandoff}
+                        onCreateHandoff={handleCreateEncryptedVault}
                       />
                     ) : (
                       <div className="empty-inspector">
@@ -3006,6 +3193,254 @@ function AdvancedFilterBar({
   );
 }
 
+function ThreadCurationPanel({
+  favoriteCount,
+  favoritesOnly,
+  labelCloud,
+  onClearLabelFilter,
+  onToggleFavoritesOnly,
+  onUseLabel,
+}: {
+  favoriteCount: number;
+  favoritesOnly: boolean;
+  labelCloud: Array<{ count: number; label: string }>;
+  onClearLabelFilter: () => void;
+  onToggleFavoritesOnly: () => void;
+  onUseLabel: (label: string) => void;
+}) {
+  return (
+    <section className="curation-panel">
+      <div className="curation-copy">
+        <p className="panel-label">Favorites and labels</p>
+        <strong>{favoriteCount} favorite thread{favoriteCount === 1 ? "" : "s"}</strong>
+        <span>Use labels for client, release, bug, research, or cleanup buckets.</span>
+      </div>
+      <div className="curation-actions">
+        <button
+          type="button"
+          className={favoritesOnly ? "chip-button chip-button-active" : "chip-button"}
+          onClick={onToggleFavoritesOnly}
+        >
+          {favoritesOnly ? "Showing favorites" : "Favorites only"}
+        </button>
+        {labelCloud.slice(0, 8).map(({ count, label }) => (
+          <button
+            type="button"
+            className="chip-button label-cloud-chip"
+            key={label}
+            onClick={() => onUseLabel(label)}
+          >
+            {label}
+            <span>{count}</span>
+          </button>
+        ))}
+        {labelCloud.length > 0 && (
+          <button type="button" className="chip-button" onClick={onClearLabelFilter}>
+            Clear label search
+          </button>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function WorkspaceGroupingPanel({
+  activeWorkspaceFilter,
+  groups,
+  onClear,
+  onSelect,
+}: {
+  activeWorkspaceFilter: string;
+  groups: WorkspaceGroup[];
+  onClear: () => void;
+  onSelect: (workspaceKey: string) => void;
+}) {
+  const topGroups = sortWorkspaceGroups(groups, "size_desc").slice(0, 6);
+  if (topGroups.length === 0) {
+    return null;
+  }
+
+  return (
+    <section className="workspace-group-panel">
+      <div className="curation-copy">
+        <p className="panel-label">Workspace grouping</p>
+        <strong>{groups.length} grouped workspace{groups.length === 1 ? "" : "s"}</strong>
+        <span>Jump between projects without scanning the full thread table.</span>
+      </div>
+      <div className="workspace-group-chips">
+        {topGroups.map((group) => (
+          <button
+            type="button"
+            className={
+              activeWorkspaceFilter === group.summary.workspaceKey
+                ? "workspace-group-chip workspace-group-chip-active"
+                : "workspace-group-chip"
+            }
+            key={group.summary.workspaceKey}
+            onClick={() => onSelect(group.summary.workspaceKey)}
+          >
+            <strong>{group.summary.workspaceLabel}</strong>
+            <span>
+              {group.summary.threadCount} threads · {formatBytes(group.summary.totalBytes)}
+            </span>
+          </button>
+        ))}
+        {activeWorkspaceFilter && (
+          <button type="button" className="chip-button" onClick={onClear}>
+            Clear workspace
+          </button>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function ThreadLabelPills({ labels }: { labels: string[] }) {
+  if (labels.length === 0) {
+    return null;
+  }
+
+  return (
+    <div className="thread-label-row" aria-label="Thread labels">
+      {labels.slice(0, 4).map((label) => (
+        <span key={label}>{label}</span>
+      ))}
+    </div>
+  );
+}
+
+function ThreadLabelsEditor({
+  draft,
+  labels,
+  onAdd,
+  onDraftChange,
+  onRemove,
+}: {
+  draft: string;
+  labels: string[];
+  onAdd: () => void;
+  onDraftChange: (value: string) => void;
+  onRemove: (label: string) => void;
+}) {
+  return (
+    <div className="thread-label-editor">
+      <div className="thread-label-row">
+        {labels.length > 0 ? (
+          labels.map((label) => (
+            <button
+              type="button"
+              className="thread-label-pill removable"
+              key={label}
+              onClick={() => onRemove(label)}
+              title={`Remove ${label}`}
+            >
+              {label}
+              <span>×</span>
+            </button>
+          ))
+        ) : (
+          <p className="action-note">No labels yet. Add labels to find this thread later.</p>
+        )}
+      </div>
+      <div className="label-input-row">
+        <input
+          value={draft}
+          onChange={(event) => onDraftChange(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              event.preventDefault();
+              onAdd();
+            }
+          }}
+          placeholder="Add label"
+        />
+        <button type="button" className="action-secondary compact-button" onClick={onAdd}>
+          Add
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function EncryptedVaultCreator({
+  backup,
+  busyToken,
+  label,
+  onCreate,
+  onLabelChange,
+  onPassphraseChange,
+  onTogglePassphrase,
+  passphrase,
+  showPassphrase,
+}: {
+  backup: BackupRecord | null;
+  busyToken: null | string;
+  label: string;
+  onCreate: (record: BackupRecord) => Promise<void>;
+  onLabelChange: (value: string) => void;
+  onPassphraseChange: (value: string) => void;
+  onTogglePassphrase: () => void;
+  passphrase: string;
+  showPassphrase: boolean;
+}) {
+  const isBusy = backup ? busyToken === `vault:create:${backup.backupId}` : false;
+  return (
+    <article className="backup-panel encrypted-vault-panel">
+      <div className="inspector-heading">
+        <p className="eyebrow">Encrypted Backup Vault</p>
+        <h3>Create private vault</h3>
+      </div>
+      {backup ? (
+        <div className="vault-source-card">
+          <span>Selected artifact</span>
+          <strong>{backup.label}</strong>
+          <small>
+            {backup.threadCount} thread{backup.threadCount === 1 ? "" : "s"} ·{" "}
+            {formatBytes(backup.artifactBytes)}
+          </small>
+        </div>
+      ) : (
+        <p className="action-note">Select a backup artifact below before creating an encrypted vault.</p>
+      )}
+      <label className="backup-directory-field">
+        <span>Vault label</span>
+        <input
+          value={label}
+          onChange={(event) => onLabelChange(event.target.value)}
+          placeholder={backup ? `${backup.label} vault` : "Encrypted thread vault"}
+        />
+      </label>
+      <label className="backup-directory-field">
+        <span>Passphrase</span>
+        <input
+          autoComplete="off"
+          spellCheck={false}
+          type={showPassphrase ? "text" : "password"}
+          value={passphrase}
+          onChange={(event) => onPassphraseChange(event.target.value)}
+          placeholder="Leave blank for generated recovery phrase"
+        />
+      </label>
+      <div className="action-row action-row-wrap">
+        <button type="button" className="action-secondary" onClick={onTogglePassphrase}>
+          {showPassphrase ? "Hide passphrase" : "Show passphrase"}
+        </button>
+        <button
+          type="button"
+          className="action-primary"
+          disabled={!backup || isBusy}
+          onClick={() => backup && void onCreate(backup)}
+        >
+          {isBusy ? "Encrypting..." : "Create vault"}
+        </button>
+      </div>
+      <p className="action-note">
+        Vaults reuse ThreadDock backup verification, then encrypt the artifact with AES-GCM before export.
+      </p>
+    </article>
+  );
+}
+
 type LensMetric = {
   detail?: string;
   label: string;
@@ -3091,19 +3526,33 @@ function LensPath({ label, value }: { label: string; value: string }) {
 function ThreadInspector({
   busyToken,
   familyRolloutBytes,
+  favorite,
+  labelDraft,
+  labels,
+  onAddLabel,
   onArchiveToggle,
   onBackup,
+  onLabelDraftChange,
   onCopyThreadId,
+  onRemoveLabel,
   onRevealPath,
+  onToggleFavorite,
   onTrash,
   thread,
 }: {
   busyToken: null | string;
   familyRolloutBytes: number;
+  favorite: boolean;
+  labelDraft: string;
+  labels: string[];
+  onAddLabel: (threadId: string, value: string) => void;
   onArchiveToggle: (thread: ThreadRecord) => Promise<void>;
   onBackup: (thread: ThreadRecord) => Promise<void>;
+  onLabelDraftChange: (value: string) => void;
   onCopyThreadId: (value: string, label: string) => Promise<void>;
+  onRemoveLabel: (threadId: string, label: string) => void;
   onRevealPath: (path: string) => Promise<void>;
+  onToggleFavorite: (threadId: string) => void;
   onTrash: (thread: ThreadRecord) => void;
   thread: ThreadRecord;
 }) {
@@ -3156,6 +3605,13 @@ function ThreadInspector({
       }
       secondaryActions={
         <>
+          <button
+            type="button"
+            className={favorite ? "action-secondary favorite-action-active" : "action-secondary"}
+            onClick={() => onToggleFavorite(thread.threadId)}
+          >
+            {favorite ? "Favorited" : "Add favorite"}
+          </button>
           <button type="button" className="action-secondary" onClick={() => void onRevealPath(thread.rolloutPath)}>
             Reveal file
           </button>
@@ -3181,6 +3637,13 @@ function ThreadInspector({
           <dd>{formatDate(thread.createdAt)}</dd>
         </div>
       </dl>
+      <ThreadLabelsEditor
+        draft={labelDraft}
+        labels={labels}
+        onAdd={() => onAddLabel(thread.threadId, labelDraft)}
+        onDraftChange={onLabelDraftChange}
+        onRemove={(label) => onRemoveLabel(thread.threadId, label)}
+      />
       <LensPath label="Working directory" value={thread.cwd ?? "Unknown"} />
       <LensPath label="Rollout path" value={thread.rolloutPath} />
     </InspectorLens>
@@ -3405,7 +3868,9 @@ function BackupInspector({
   onCreateHandoff: (record: BackupRecord) => Promise<void>;
   onRevealPath: (path: string) => Promise<void>;
 }) {
-  const isHandoffPending = busyToken === `handoff:create:${backup.backupId}`;
+  const isHandoffPending =
+    busyToken === `handoff:create:${backup.backupId}` ||
+    busyToken === `vault:create:${backup.backupId}`;
   return (
     <InspectorLens
       code={backup.backupId}
@@ -3415,7 +3880,7 @@ function BackupInspector({
         { label: "Rollout", value: formatBytes(backup.totalBytes), detail: backup.format },
         { label: "Artifact", value: formatBytes(backup.artifactBytes), detail: formatDate(backup.createdAt) },
       ]}
-      note="Portable artifact ready for restore-first workflows or a private handoff."
+      note="Portable artifact ready for restore-first workflows or encrypted vault packaging."
       primaryActions={
         <button type="button" className="action-secondary" onClick={() => void onRevealPath(backup.targetPath)}>
           Reveal artifact
@@ -3428,7 +3893,7 @@ function BackupInspector({
             disabled={isHandoffPending}
             onClick={() => void onCreateHandoff(backup)}
           >
-          {isHandoffPending ? "Encrypting..." : "Create Secure Handoff"}
+          {isHandoffPending ? "Encrypting..." : "Create encrypted vault"}
         </button>
       }
       title={backup.label}
@@ -3481,14 +3946,14 @@ function SecureHandoffCard({
   return (
     <InspectorLens
       code={handoff ? handoff.handoffId : "no network listener"}
-      eyebrow="Handoff lens"
+      eyebrow="Vault lens"
       metrics={[
         { label: "Mode", value: "File", detail: "offline" },
         { label: "Crypto", value: "AES-GCM", detail: "PBKDF2" },
         { label: "Network", value: "None", detail: "local-only" },
       ]}
       note="Create an encrypted file from a backup, then move it with USB, Bluetooth, AirDrop, Nearby Share, or any private channel."
-      title="Secure handoff desk"
+      title="Encrypted backup vault"
       tone="handoff"
     >
       {handoff ? (
@@ -3530,12 +3995,12 @@ function SecureHandoffCard({
             className="action-secondary compact-button"
             onClick={() => void onRevealPath(handoff.targetPath)}
           >
-            Reveal handoff
+            Reveal vault
           </button>
         </div>
       ) : (
         <p className="action-note">
-          Select a backup artifact and create a secure handoff when you need to move it to another computer.
+          Select a backup artifact and create an encrypted vault when you need to move it to another computer.
         </p>
       )}
     </InspectorLens>
@@ -3730,6 +4195,8 @@ function HealthPage({
   healthData: HealthSummary;
 }) {
   const issues = [
+    ...healthData.duplicateThreads,
+    ...healthData.malformedRollouts,
     ...healthData.unreadableMetadata,
     ...healthData.missingRollouts,
     ...healthData.orphanedFamilies.map((family) => ({
@@ -3754,6 +4221,8 @@ function HealthPage({
         <SummaryCard description="Indexed backup artifacts" label="Backup Artifacts" value={String(backupCount)} />
         <SummaryCard description="Unreadable or orphaned records" label="Integrity Issues" value={String(healthData.totalIssues)} />
       </section>
+
+      <ThreadHealthCheckPanel health={healthData.threadHealth} />
 
       <section className={healthData.appServer.available ? "status-card" : "status-card status-card-error"}>
         <h3>{healthData.appServer.available ? "Codex App Server available" : "Codex App Server degraded"}</h3>
@@ -3892,6 +4361,69 @@ function HealthPage({
         </aside>
       </div>
     </>
+  );
+}
+
+function ThreadHealthCheckPanel({ health }: { health: ThreadHealthCheckSummary }) {
+  const checks = [
+    {
+      detail: "same id indexed more than once",
+      label: "Duplicates",
+      value: health.duplicateThreads.length,
+    },
+    {
+      detail: "rollouts that could not be parsed",
+      label: "Malformed",
+      value: health.malformedRollouts.length,
+    },
+    {
+      detail: "metadata or rollout file missing",
+      label: "Missing",
+      value: health.missingRollouts.length + health.unreadableMetadata.length,
+    },
+    {
+      detail: "subagents with missing parent thread",
+      label: "Orphans",
+      value: health.orphanedFamilies.length,
+    },
+    {
+      detail: "external archive records",
+      label: "Read-only",
+      value: health.readOnlyCount,
+    },
+    {
+      detail: "no updates in 60+ days",
+      label: "Stale",
+      value: health.staleCount,
+    },
+  ];
+
+  return (
+    <section className="thread-health-panel">
+      <div className="thread-health-score">
+        <strong>{health.score}</strong>
+        <span>{health.label}</span>
+      </div>
+      <div className="thread-health-copy">
+        <div className="inspector-heading">
+          <p className="eyebrow">Thread Health Check</p>
+          <h3>Library integrity and maintenance readiness</h3>
+        </div>
+        <div className="thread-health-grid">
+          {checks.map((check) => (
+            <div key={check.label}>
+              <span>{check.label}</span>
+              <strong>{check.value}</strong>
+              <small>{check.detail}</small>
+            </div>
+          ))}
+        </div>
+        <p className="action-note">
+          The score is read-only and combines scan integrity, orphaned subagent families, stale
+          threads, and external read-only records. Lifecycle fixes still require explicit action.
+        </p>
+      </div>
+    </section>
   );
 }
 
@@ -4516,14 +5048,26 @@ function getFamilyMembers(family: FamilyGroup): ThreadRecord[] {
   return family.parentThread ? [family.parentThread, ...family.threads] : family.threads;
 }
 
-function matchesThreadFilters(thread: ThreadRecord, filters: ThreadFilters): boolean {
+function matchesThreadFilters(
+  thread: ThreadRecord,
+  filters: ThreadFilters,
+  metadata?: ThreadUserMetadata,
+  favoritesOnly = false,
+): boolean {
+  if (favoritesOnly && (!metadata || !isFavoriteThread(metadata, thread.threadId))) {
+    return false;
+  }
+
   const normalizedQuery = filters.query.trim().toLowerCase();
+  const labels = metadata ? getThreadLabels(metadata, thread.threadId) : [];
   if (
     normalizedQuery &&
     !(
       thread.title.toLowerCase().includes(normalizedQuery) ||
       thread.threadId.toLowerCase().includes(normalizedQuery) ||
-      (thread.cwd ?? "").toLowerCase().includes(normalizedQuery)
+      (thread.cwd ?? "").toLowerCase().includes(normalizedQuery) ||
+      labels.some((label) => label.toLowerCase().includes(normalizedQuery)) ||
+      (metadata && isFavoriteThread(metadata, thread.threadId) && "favorite".includes(normalizedQuery))
     )
   ) {
     return false;
@@ -4545,11 +5089,17 @@ function matchesThreadFilters(thread: ThreadRecord, filters: ThreadFilters): boo
     return false;
   }
 
-  if (
-    filters.workspaceFilter.trim() &&
-    !(thread.cwd ?? "").toLowerCase().includes(filters.workspaceFilter.trim().toLowerCase())
-  ) {
-    return false;
+  const workspaceFilter = filters.workspaceFilter.trim().toLowerCase();
+  if (workspaceFilter) {
+    const workspaceValue = (thread.cwd ?? "").toLowerCase();
+    const wantsUnknown = workspaceFilter === "__unknown__" || workspaceFilter === "unknown";
+    if (wantsUnknown) {
+      if (thread.cwd?.trim()) {
+        return false;
+      }
+    } else if (!workspaceValue.includes(workspaceFilter)) {
+      return false;
+    }
   }
 
   if (filters.sourceFilter !== "all" && thread.threadSource !== filters.sourceFilter) {
@@ -4587,29 +5137,49 @@ function matchesThreadFilters(thread: ThreadRecord, filters: ThreadFilters): boo
   return true;
 }
 
-function matchesFamilyFilters(family: FamilyGroup, filters: ThreadFilters): boolean {
+function matchesFamilyFilters(
+  family: FamilyGroup,
+  filters: ThreadFilters,
+  metadata?: ThreadUserMetadata,
+  favoritesOnly = false,
+): boolean {
   const members = getFamilyMembers(family);
+  if (favoritesOnly && (!metadata || !members.some((thread) => isFavoriteThread(metadata, thread.threadId)))) {
+    return false;
+  }
   if (
     filters.query.trim() &&
     !(
       family.parentTitle.toLowerCase().includes(filters.query.trim().toLowerCase()) ||
-      members.some((thread) => matchesThreadFilters(thread, { ...filters, query: "", workspaceFilter: "", threadIdQuery: "", parentThreadIdQuery: "", dateFrom: "", dateTo: "" }))
+      members.some((thread) =>
+        matchesThreadFilters(
+          thread,
+          { ...filters, query: "", workspaceFilter: "", threadIdQuery: "", parentThreadIdQuery: "", dateFrom: "", dateTo: "" },
+          metadata,
+          false,
+        ),
+      )
     )
   ) {
     return false;
   }
-  return members.some((thread) => matchesThreadFilters(thread, filters));
+  return members.some((thread) => matchesThreadFilters(thread, filters, metadata, favoritesOnly));
 }
 
-function matchesWorkspaceFilters(group: WorkspaceGroup, filters: ThreadFilters): boolean {
+function matchesWorkspaceFilters(
+  group: WorkspaceGroup,
+  filters: ThreadFilters,
+  metadata?: ThreadUserMetadata,
+  favoritesOnly = false,
+): boolean {
   if (
     filters.query.trim() &&
     !group.summary.workspaceLabel.toLowerCase().includes(filters.query.trim().toLowerCase()) &&
-    !group.threads.some((thread) => matchesThreadFilters(thread, filters))
+    !group.threads.some((thread) => matchesThreadFilters(thread, filters, metadata, favoritesOnly))
   ) {
     return false;
   }
-  return group.threads.some((thread) => matchesThreadFilters(thread, filters));
+  return group.threads.some((thread) => matchesThreadFilters(thread, filters, metadata, favoritesOnly));
 }
 
 function matchesTrashFilters(record: TrashRecord, filters: ThreadFilters): boolean {
@@ -4650,6 +5220,45 @@ function matchesTrashFilters(record: TrashRecord, filters: ThreadFilters): boole
 
 function isCorruptTrashRecord(record: TrashRecord): boolean {
   return record.threadId.startsWith("corrupt-trash-");
+}
+
+function getThreadLabels(metadata: ThreadUserMetadata, threadId: string): string[] {
+  return metadata.labelsByThreadId[threadId] ?? [];
+}
+
+function isFavoriteThread(metadata: ThreadUserMetadata, threadId: string): boolean {
+  return metadata.favoriteThreadIds.includes(threadId);
+}
+
+function normalizeThreadLabel(value: unknown): string {
+  if (typeof value !== "string") {
+    return "";
+  }
+  return value
+    .trim()
+    .replace(/\s+/g, "-")
+    .replace(/[^a-zA-Z0-9_.-]/g, "")
+    .slice(0, 24)
+    .toLowerCase();
+}
+
+function buildLabelCloud(
+  metadata: ThreadUserMetadata,
+  threads: ThreadRecord[],
+): Array<{ count: number; label: string }> {
+  const liveThreadIds = new Set(threads.map((thread) => thread.threadId));
+  const counts = new Map<string, number>();
+  for (const [threadId, labels] of Object.entries(metadata.labelsByThreadId)) {
+    if (!liveThreadIds.has(threadId)) {
+      continue;
+    }
+    for (const label of labels) {
+      counts.set(label, (counts.get(label) ?? 0) + 1);
+    }
+  }
+  return [...counts.entries()]
+    .map(([label, count]) => ({ count, label }))
+    .sort((left, right) => right.count - left.count || left.label.localeCompare(right.label));
 }
 
 function buildRuleMatches(threads: ThreadRecord[], draft: RuleDraft): ThreadRecord[] {
@@ -4828,6 +5437,51 @@ function buildBackupHealth(
     score: boundedScore,
     verifiedArtifacts: records.length,
     warningCount: issues.length,
+  };
+}
+
+function buildThreadHealthCheckSummary({
+  duplicateThreads,
+  malformedRollouts,
+  missingRollouts,
+  orphanedFamilies,
+  threads,
+  unreadableMetadata,
+}: {
+  duplicateThreads: ThreadLibrarySnapshot["scanIssues"];
+  malformedRollouts: ThreadLibrarySnapshot["scanIssues"];
+  missingRollouts: ThreadLibrarySnapshot["scanIssues"];
+  orphanedFamilies: FamilyGroup[];
+  threads: ThreadRecord[];
+  unreadableMetadata: ThreadLibrarySnapshot["scanIssues"];
+}): ThreadHealthCheckSummary {
+  const staleCount = threads.filter((thread) => {
+    const age = getAgeDays(thread.updatedAt ?? thread.createdAt);
+    return age !== null && age >= 60;
+  }).length;
+  const readOnlyCount = threads.filter((thread) => thread.readOnly).length;
+  const blockingIssues =
+    duplicateThreads.length +
+    malformedRollouts.length +
+    missingRollouts.length +
+    unreadableMetadata.length;
+  let score = 100;
+  score -= Math.min(50, blockingIssues * 18);
+  score -= Math.min(24, orphanedFamilies.length * 8);
+  score -= Math.min(12, Math.floor(staleCount / 4) * 3);
+  score -= Math.min(8, Math.floor(readOnlyCount / 8) * 2);
+  const boundedScore = Math.max(0, Math.min(100, score));
+
+  return {
+    duplicateThreads,
+    label: boundedScore >= 92 ? "Clean" : boundedScore >= 72 ? "Watch" : "Needs attention",
+    malformedRollouts,
+    missingRollouts,
+    orphanedFamilies,
+    readOnlyCount,
+    score: boundedScore,
+    staleCount,
+    unreadableMetadata,
   };
 }
 
@@ -5155,8 +5809,8 @@ function buildHeroMetrics({
           value: String(backupRecords.length),
         },
         {
-          detail: "encrypted file handoffs without an open network port",
-          label: "Secure handoff",
+          detail: "encrypted backup vaults without an open network port",
+          label: "Vault mode",
           value: "Offline",
         },
         {
@@ -5414,8 +6068,8 @@ function getSectionCopy(
     case "backups":
       return {
         eyebrow: "Backups",
-        title: "Portable backup exports",
-        note: "Export, import, and share thread bundles across machines without touching live Codex state until you explicitly restore.",
+        title: "Portable backup exports and encrypted vaults",
+        note: "Export, import, and encrypt thread bundles across machines without touching live Codex state until you explicitly restore.",
         searchable: false,
         showSummary: false,
         emptyTitle: "No backups recorded yet",
@@ -5541,6 +6195,59 @@ function writeRuleDraftSetting(draft: RuleDraft) {
     window.localStorage.setItem("threaddock.ruleDraft", JSON.stringify(draft));
   } catch {
     // Ignore local persistence failures.
+  }
+}
+
+function readThreadMetadataSetting(): ThreadUserMetadata {
+  const fallback: ThreadUserMetadata = {
+    favoriteThreadIds: [],
+    labelsByThreadId: {},
+  };
+  if (typeof window === "undefined") {
+    return fallback;
+  }
+  try {
+    const raw = window.localStorage.getItem("threaddock.threadMetadata");
+    if (!raw) {
+      return fallback;
+    }
+    const parsed = JSON.parse(raw) as Partial<ThreadUserMetadata>;
+    const favoriteThreadIds = Array.isArray(parsed.favoriteThreadIds)
+      ? parsed.favoriteThreadIds.filter((value): value is string => typeof value === "string")
+      : [];
+    const labelsByThreadId: Record<string, string[]> = {};
+    if (parsed.labelsByThreadId && typeof parsed.labelsByThreadId === "object") {
+      for (const [threadId, labels] of Object.entries(parsed.labelsByThreadId)) {
+        if (!Array.isArray(labels)) {
+          continue;
+        }
+        const cleanLabels = labels
+          .map((label) => normalizeThreadLabel(label))
+          .filter((label): label is string => Boolean(label));
+        if (cleanLabels.length > 0) {
+          labelsByThreadId[threadId] = [...new Set(cleanLabels)].sort((left, right) =>
+            left.localeCompare(right),
+          );
+        }
+      }
+    }
+    return {
+      favoriteThreadIds: [...new Set(favoriteThreadIds)],
+      labelsByThreadId,
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+function writeThreadMetadataSetting(metadata: ThreadUserMetadata) {
+  if (typeof window === "undefined") {
+    return;
+  }
+  try {
+    window.localStorage.setItem("threaddock.threadMetadata", JSON.stringify(metadata));
+  } catch {
+    // Ignore local metadata persistence failures.
   }
 }
 

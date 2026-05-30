@@ -9,7 +9,11 @@ ThreadDock is a local-first desktop control room for Codex threads. It is built 
 - Subagent family view with parent-aware grouping, family archive/unarchive, and family backup export
 - Exact rollout-size reporting per thread and aggregated family storage
 - Health view for largest threads/families, malformed rollouts, missing rollouts, orphaned families, and App Server status
+- Thread Health Check score with duplicate, malformed, missing, orphaned, stale, and read-only diagnostics
+- Workspace grouping shortcuts for quickly filtering thread surfaces by project folder
+- Favorites and labels for local per-thread organization
 - Portable backup artifacts as either `.threaddock-backup.zip` bundles or plain-folder exports with manifest metadata and SHA-256 verification
+- Encrypted Backup Vault creation and import flows for private file-based backups
 - Backup history library with artifact inspection, verified preview, and guarded restore/import
 - Secure Handoff `.threaddock-handoff` files for private computer-to-computer migration without LAN listeners or cloud services
 - Backup Health Score for last-backup age, verified artifacts, warnings, and largest unbacked threads

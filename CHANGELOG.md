@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.2 - 2026-05-30
+
+Feature update.
+
+- Added encrypted backup vault creation/import flows.
+- Added expanded thread health checks.
+- Added workspace grouping shortcuts.
+- Added local favorites and labels for threads.
+
 ## 0.1.1 - 2026-05-27
 
 Security and bug fixes.
